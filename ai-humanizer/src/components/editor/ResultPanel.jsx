@@ -1,3 +1,4 @@
+import { formatAuditFlag } from '@/lib/audit';
 import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -10,15 +11,19 @@ import { AlertTriangle, Check, Copy, Download, RotateCcw } from 'lucide-react';
 
 export default function ResultPanel({ job, review, decisions, onToggle, onAll, text, onNew }) {
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
+  const changedReview = Object.values(decisions).some((accepted) => accepted === false);
   const flags = job.unresolved_flags || [];
 
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(text);
       setCopied(true);
+      setCopyError(false);
       setTimeout(() => setCopied(false), 2000);
     } catch {
       setCopied(false);
+      setCopyError(true);
     }
   };
 
@@ -32,20 +37,22 @@ export default function ResultPanel({ job, review, decisions, onToggle, onAll, t
           </p>
           <ul className="mt-2 space-y-1 text-xs leading-relaxed text-warning/95">
             {flags.slice(0, 5).map((flag, index) => (
-              <li key={index}>{flag}</li>
+              <li key={index}>{formatAuditFlag(flag)}</li>
             ))}
           </ul>
           <p className="mt-2 text-xs text-muted-foreground">
-            Two repair passes could not resolve these. Read them in the Claim audit tab — they are
-            never hidden.
+            These items remain unresolved after automated checks. Compare them with your original in the Claim audit tab.
           </p>
         </div>
       ) : (
         <div className="flex items-center gap-2 rounded-2xl border border-success/35 bg-success/10 p-4 text-sm text-success">
           <Check className="h-4 w-4" />
-          Every claim, number, name, citation and quotation was confirmed against your original.
+          Automated checks found no unresolved issues. Please review the result for accuracy.
         </div>
       )}
+
+      {changedReview ? <p role="status" className="rounded-xl border border-border p-3 text-sm text-muted-foreground">You have rejected changes. The audit describes the AI rewrite before your edits; review your final text again before sharing.</p> : null}
+      {copyError ? <p role="status" className="text-sm text-destructive">Copy was unavailable. Select the clean result to copy it, or download a file.</p> : null}
 
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>

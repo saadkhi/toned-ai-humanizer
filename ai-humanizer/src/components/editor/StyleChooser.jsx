@@ -32,6 +32,7 @@ export default function StyleChooser({ style, customStyle, onStyle, onCustomStyl
       {style === 'custom' ? (
         <Input
           value={customStyle}
+          maxLength={1000}
           onChange={(event) => onCustomStyle(event.target.value)}
           placeholder="Plain and short. No throat-clearing."
           aria-label="Custom voice instruction"

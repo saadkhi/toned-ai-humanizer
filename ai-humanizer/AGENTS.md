@@ -1,34 +1,15 @@
-# AGENTS.md
+# Toned AI Humanizer
 
-## Project Context
+Read README.md before changing the application. This repository is a React/Vite frontend with Node Vercel API functions. Browser-local storage holds rewrite history; there is no account system or application database.
 
-This is a Base44 app repository. Treat it as user-owned application code, keep changes focused on the user's request, and preserve existing project conventions.
+- `src/`: screens, browser job store, and sequential pipeline client.
+- `api/run-stage.js`: validated rewrite-and-audit stages.
+- `api/_pipeline.js`, `_config.js`, `_security.js`: provider transport, server configuration, and spend protection.
+- `api/health.js`: configuration readiness without secrets or a live provider call.
+- `scripts/local-api.js`: Vite development adapter for the same production handlers.
 
-Start with `README.md` for local setup, environment variables, and publish workflow.
+Run `npm ci`, then `npm run dev` from this directory. Keep API keys in server environment variables or ignored `.env.local`; never use a `VITE_` credential or expose provider responses containing secrets. Do not log document bodies.
 
-## Base44 References
+Use the existing checkout. Cloud tasks are already isolated; do not create a Git worktree unless the user requests it.
 
-- CLI overview: https://docs.base44.com/developers/references/cli/get-started/overview.md
-- Agent skills: https://docs.base44.com/developers/backend/overview/skills.md
-
-If your agent supports Agent Skills, install or update Base44 skills before Base44-specific work:
-
-```bash
-npx skills add base44/skills
-```
-
-## Key Files
-
-- `src/`: frontend application source.
-- `src/api/base44Client.js`: frontend Base44 SDK client.
-- `vite.config.js`: Vite config and Base44 Vite plugin setup.
-- `.env.local`: local-only environment values; never commit secrets.
-
-## Working Notes
-
-- Use `base44 dev` as the default local development command when you need the local Base44 backend. It can run the backend and frontend together.
-- When docs or code mention the frontend being started automatically, that usually means the Base44 project config includes `site.serveCommand`, for example `"serveCommand": "npm run dev"` in `base44/config.jsonc`.
-- Use `npm run dev` only for frontend-only work against the hosted Base44 backend.
-- Prefer the existing Base44 CLI workflow over adding new npm scripts for Base44-specific tasks.
-- Reuse the existing SDK client and Vite plugin patterns before adding new Base44 integration paths.
-- Run the relevant checks from `package.json` before finishing code changes.
+Run `npm run check` and `npm run test:e2e` for relevant changes. Browser tests use Chromium (`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` may select an installed browser). Mock provider requests in automated tests; live model checks require a real configured key and may incur charges. Never mark incomplete, unaudited, or malformed model output as successfully verified. Human review is still required.

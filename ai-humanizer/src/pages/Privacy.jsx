@@ -2,28 +2,28 @@ import SiteHeader from '@/components/SiteHeader';
 
 const SECTIONS = [
   {
-    title: 'What we store',
-    body: 'The text you submit, the rewrite, the audit report, and the settings you choose. If you open a file on your device it is read in your browser and never uploaded.',
+    title: 'History stays in your browser',
+    body: 'Your original text, rewrites, audit reports and preferences are saved in this browser’s local storage. There is no user account or cross-device sync. Anyone with access to this browser profile may be able to read that history. Clearing site data removes it.',
   },
   {
-    title: 'How long we keep it',
-    body: 'You choose the window: 7, 30 or 90 days, or delete-as-soon-as-you-close-the-result. Expired rewrites are deleted automatically when you next open your history, and "delete everything" in settings removes them immediately.',
+    title: 'AI processing',
+    body: 'When you run a rewrite, your text, instructions and relevant job details are sent through this service’s API to the configured AI provider. Files are read on your device; their text is sent when you choose Rewrite. The provider’s retention and training policies apply. Do not submit information you are not permitted to share.',
   },
   {
-    title: 'How it is processed',
-    body: 'Your text is sent to the language model configured for this app so that it can be diagnosed, rewritten and audited. It is not used to train models and is not used to improve anyone else\'s results.',
+    title: 'Retention and deletion',
+    body: 'Choose no history, or a local retention window of 7, 30 or 90 days. With no history, the job remains in page memory only. Expired saved jobs are removed when you use the app; deletion does not run while the site is closed. Delete individual rewrites in History or all rewrites in Data & settings. This removes browser copies, not records retained by hosting or AI providers.',
   },
   {
-    title: 'Access',
-    body: 'Rewrites are private to your account. Row-level rules in the database mean another signed-in user cannot read, change or delete your records even if they guess an identifier.',
+    title: 'Server and provider data',
+    body: 'The application does not use a server-side database for rewrite history and does not intentionally log document text or credentials. Hosting infrastructure and AI providers may retain request metadata or submitted content under their own policies. This application cannot guarantee deletion from those systems.',
+  },
+  {
+    title: 'Request limits',
+    body: 'Production request limits use a shared counter service. It receives a hashed network address identifier and request counters, not document text or raw network addresses. Counters expire at the end of the rate-limit window or day. The hosting service still receives your network address to handle requests.',
   },
   {
     title: 'Your controls',
-    body: 'You can delete any single rewrite from your history, change the retention window at any time, and delete all of your data in one action. Deletion removes the records from the database.',
-  },
-  {
-    title: 'Logs',
-    body: 'Operational logs record which stage ran, which model was used, how many tokens it consumed and how long it took. They never contain your text.',
+    body: 'You can read, copy, download or delete your rewrites. Your browser is the only source of saved history, so keep a separate copy of anything you need. There is no account recovery for deleted or lost browser data.',
   },
 ];
 
@@ -32,10 +32,7 @@ export default function Privacy() {
     <div className="min-h-screen bg-background">
       <SiteHeader />
       <main className="mx-auto w-full max-w-3xl px-4 py-16 sm:px-6">
-        <div className="rounded-xl border border-warning/45 bg-warning/10 p-4 text-sm text-warning">
-          Placeholder — legal review required before publishing.
-        </div>
-        <p className="eyebrow mt-10">Privacy policy</p>
+        <p className="eyebrow">How your data is handled</p>
         <h1 className="mt-4 text-4xl">Privacy</h1>
         <div className="mt-10 space-y-8">
           {SECTIONS.map((section) => (

@@ -1,3 +1,4 @@
+import { formatAuditFlag } from '@/lib/audit';
 const STATUS_STYLES = {
   preserved: 'bg-success/12 text-success',
   altered: 'bg-destructive/12 text-destructive',
@@ -47,14 +48,14 @@ export default function AuditPanel({ audit, flags }) {
           <p className="text-sm font-medium text-warning">Unresolved after repair</p>
           <ul className="mt-2 space-y-1 text-xs text-warning/95">
             {flags.slice(0, 12).map((flag, index) => (
-              <li key={index}>{flag}</li>
+              <li key={index}>{formatAuditFlag(flag)}</li>
             ))}
           </ul>
         </div>
       ) : null}
 
       <div className="space-y-2">
-        <p className="eyebrow">Every item checked</p>
+        <p className="eyebrow">Items checked</p>
         <ul className="divide-y divide-border/60 overflow-hidden rounded-xl border border-border/70">
           {items.map((item, index) => (
             <li key={index} className="flex flex-wrap items-start justify-between gap-2 bg-card px-3 py-2.5">

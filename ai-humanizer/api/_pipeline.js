@@ -1,6 +1,6 @@
 /**
  * Shared pipeline utilities for Vercel API routes.
- * Ported from the Base44 runtime-injected pipeline.ts.
+ * Bounded provider calls, structured responses, and factual consistency checks.
  */
 
 // ─── LLM Error ────────────────────────────────────────────────────────────────
@@ -28,7 +28,7 @@ export class LLMError extends Error {
 //
 export class KeyPool {
   constructor(keys = []) {
-    this._keys = keys.filter(Boolean);
+    this._keys = [...new Set(keys.filter((key) => typeof key === 'string' && key.trim()).map((key) => key.trim()))];
     this._index = 0;
     this._failures = {};
   }
@@ -59,327 +59,207 @@ export class KeyPool {
   }
 }
 
-// ─── Retry / timeout constants ────────────────────────────────────────────────
-//
-// 3 attempts, 150 s abort each.
-// Total worst-case: 150 s + 3 s + 150 s + 6 s + 150 s = ~459 s.
-// Vercel Pro supports up to 800 s. On the Hobby plan (300 s limit) set
-// MAX_ATTEMPTS=2 and ATTEMPT_TIMEOUT_MS=90_000.
-const MAX_ATTEMPTS = 3;
-const ATTEMPT_TIMEOUT_MS = 150_000;
-const BACKOFF_MS = [3000, 6000]; // wait between attempt 1→2 and 2→3
+// Each model call has a bounded total budget, including response-body reads and retries.
+// Two model calls can occur in a stage; the default keeps both below Vercel's 300s limit.
+function boundedInt(value, fallback, min, max) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(min, Math.min(max, Math.floor(number))) : fallback;
+}
 
-// ─── Low-level HTTP helper ────────────────────────────────────────────────────
+export function requestLimits(env = process.env) {
+  return {
+    timeout: boundedInt(env.LLM_REQUEST_TIMEOUT_MS, 60000, 100, 60000),
+    total: boundedInt(env.LLM_TOTAL_TIMEOUT_MS, 120000, 100, 120000),
+    attempts: boundedInt(env.LLM_MAX_ATTEMPTS, 2, 1, 4),
+  };
+}
 
-async function postOnce(url, options) {
+async function postJson(url, options, timeout) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ATTEMPT_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
+    // A provider redirect must never forward custom credential headers elsewhere.
+    const response = await fetch(url, { ...options, redirect: 'error', signal: controller.signal });
+    if (!response.ok) {
+      // Never forward upstream bodies: they may echo credentials, prompts, or source text.
+      const retryable = response.status === 429 || response.status >= 500;
+      throw new LLMError(
+        retryable ? 'The AI provider is temporarily unavailable. Please retry.'
+          : 'The AI provider rejected the request. Check the server credentials and model configuration.',
+        retryable ? 'upstream_unavailable' : 'request_rejected',
+        retryable ? 503 : 502,
+      );
+    }
+    try {
+      return await response.json();
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
+      throw new LLMError('The AI provider returned an invalid response.', 'invalid_response', 502);
+    }
+  } catch (error) {
+    if (error instanceof LLMError) throw error;
+    throw new LLMError(
+      controller.signal.aborted ? 'The AI provider timed out. Please retry.' : 'Unable to reach the AI provider. Please retry.',
+      controller.signal.aborted ? 'timeout' : 'network_error',
+      controller.signal.aborted ? 504 : 503,
+    );
+  } finally {
     clearTimeout(timer);
-    return response;
-  } catch (err) {
-    clearTimeout(timer);
-    throw err;
   }
 }
 
-// ─── Provider-specific HTTP callers ──────────────────────────────────────────
-//
-// Each returns { text, inputTokens, outputTokens } or throws LLMError.
-// They are intentionally thin — no retry logic here; that lives in pooledComplete.
+function verifyText(text, finishReason) {
+  if (['MAX_TOKENS', 'length'].includes(finishReason)) {
+    throw new LLMError('The AI response was cut off. Try a shorter document.', 'truncated_response', 502);
+  }
+  if (typeof text !== 'string' || !text.trim()) {
+    throw new LLMError('The AI provider returned no usable text.', 'empty_response', 502);
+  }
+  return text.trim();
+}
 
-/** Google AI Studio — generateContent endpoint */
-async function callGoogle({ key, model, system, user, maxTokens }) {
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
-  const response = await postOnce(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      system_instruction: { parts: [{ text: system }] },
-      contents: [{ role: 'user', parts: [{ text: user }] }],
-      generationConfig: { maxOutputTokens: maxTokens || 4000, temperature: 1 },
-    }),
-  });
-  if (response.status === 429 || response.status >= 500) {
-    throw new LLMError(`Google upstream unavailable (${response.status})`, 'upstream_unavailable', 503);
-  }
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new LLMError(`Google request rejected (${response.status}): ${detail}`, 'request_rejected', 400);
-  }
-  const payload = await response.json();
-  const candidate = (payload.candidates || [])[0];
+async function callGoogle({ key, model, system, user, maxTokens, json, timeout }) {
+  const payload = await postJson(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: system }] },
+        contents: [{ role: 'user', parts: [{ text: user }] }],
+        generationConfig: {
+          maxOutputTokens: maxTokens || 4000,
+          temperature: json ? 0 : 0.2,
+          ...(json ? { responseMimeType: 'application/json' } : {}),
+        },
+      }),
+    },
+    timeout,
+  );
+  const candidate = payload.candidates?.[0];
   const text = (candidate?.content?.parts || [])
-    .map((p) => (typeof p.text === 'string' ? p.text : ''))
-    .join('')
-    .trim();
-  const usage = payload.usageMetadata || {};
+    .filter((part) => !part.thought)
+    .map((part) => typeof part.text === 'string' ? part.text : '').join('');
   return {
-    text,
-    inputTokens: usage.promptTokenCount || 0,
-    outputTokens: usage.candidatesTokenCount || 0,
+    text: verifyText(text, candidate?.finishReason),
+    inputTokens: payload.usageMetadata?.promptTokenCount || 0,
+    outputTokens: payload.usageMetadata?.candidatesTokenCount || 0,
   };
 }
 
-/** OpenRouter — OpenAI-compatible chat completions endpoint.
- *  Can route to virtually any model (Gemini, Claude, GPT, Llama, etc.) */
-async function callOpenRouter({ key, model, system, user, maxTokens }) {
-  const response = await postOnce('https://openrouter.ai/api/v1/chat/completions', {
+async function callChat({ provider, key, model, system, user, maxTokens, json, timeout }) {
+  const endpoint = provider === 'openrouter'
+    ? 'https://openrouter.ai/api/v1/chat/completions'
+    : 'https://api.sambanova.ai/v1/chat/completions';
+  const payload = await postJson(endpoint, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'authorization': `Bearer ${key}`,
-      'http-referer': 'https://toned.ai',
-      'x-title': 'Toned AI Humanizer',
-    },
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
     body: JSON.stringify({
       model,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
       max_tokens: maxTokens || 4000,
-      temperature: 1,
+      temperature: json ? 0 : 0.2,
+      ...(json ? { response_format: { type: 'json_object' } } : {}),
     }),
-  });
-  if (response.status === 429 || response.status >= 500) {
-    throw new LLMError(`OpenRouter upstream unavailable (${response.status})`, 'upstream_unavailable', 503);
-  }
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new LLMError(`OpenRouter request rejected (${response.status}): ${detail}`, 'request_rejected', 400);
-  }
-  const payload = await response.json();
-  const text = (payload.choices?.[0]?.message?.content || '').trim();
-  const usage = payload.usage || {};
+  }, timeout);
   return {
-    text,
-    inputTokens: usage.prompt_tokens || 0,
-    outputTokens: usage.completion_tokens || 0,
+    text: verifyText(payload.choices?.[0]?.message?.content, payload.choices?.[0]?.finish_reason),
+    inputTokens: payload.usage?.prompt_tokens || 0,
+    outputTokens: payload.usage?.completion_tokens || 0,
   };
 }
 
-/** SambaNova — OpenAI-compatible endpoint, optimised for high-throughput fast inference */
-async function callSambaNova({ key, model, system, user, maxTokens }) {
-  const response = await postOnce('https://api.sambanova.ai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'authorization': `Bearer ${key}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-      max_tokens: maxTokens || 4000,
-      temperature: 1,
-    }),
-  });
-  if (response.status === 429 || response.status >= 500) {
-    throw new LLMError(`SambaNova upstream unavailable (${response.status})`, 'upstream_unavailable', 503);
-  }
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new LLMError(`SambaNova request rejected (${response.status}): ${detail}`, 'request_rejected', 400);
-  }
-  const payload = await response.json();
-  const text = (payload.choices?.[0]?.message?.content || '').trim();
-  const usage = payload.usage || {};
+async function callCloudflare({ key, model, system, user, maxTokens, accountId, json, timeout }) {
+  if (!accountId) throw new LLMError('Cloudflare account configuration is missing.', 'no_account_id', 503);
+  const payload = await postJson(
+    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/run/${model}`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+        max_tokens: maxTokens || 4000,
+        temperature: json ? 0 : 0.2,
+        ...(json ? { response_format: { type: 'json_object' } } : {}),
+      }),
+    }, timeout,
+  );
+  if (payload.success === false) throw new LLMError('The AI provider returned an invalid response.', 'invalid_response', 502);
   return {
-    text,
-    inputTokens: usage.prompt_tokens || 0,
-    outputTokens: usage.completion_tokens || 0,
+    text: verifyText(payload.result?.response),
+    inputTokens: payload.result?.usage?.prompt_tokens || 0,
+    outputTokens: payload.result?.usage?.completion_tokens || 0,
   };
 }
 
-/** Cloudflare Workers AI — REST endpoint.
- *  model must be the full CF model path e.g. "@cf/meta/llama-3.1-8b-instruct" */
-async function callCloudflare({ key, model, system, user, maxTokens, accountId }) {
-  if (!accountId) {
-    throw new LLMError('CLOUDFLARE_ACCOUNT_ID is not configured.', 'no_account_id', 500);
-  }
-  const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${model}`;
-  const response = await postOnce(url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'authorization': `Bearer ${key}`,
-    },
-    body: JSON.stringify({
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-      max_tokens: maxTokens || 4000,
-    }),
-  });
-  if (response.status === 429 || response.status >= 500) {
-    throw new LLMError(`Cloudflare upstream unavailable (${response.status})`, 'upstream_unavailable', 503);
-  }
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new LLMError(`Cloudflare request rejected (${response.status}): ${detail}`, 'request_rejected', 400);
-  }
-  const payload = await response.json();
-  const text = (payload.result?.response || '').trim();
-  // Cloudflare doesn't return token counts on all models
-  return { text, inputTokens: 0, outputTokens: 0 };
-}
-
-// ─── Pool-aware multi-provider caller ────────────────────────────────────────
-//
-// Tries providers in priority order, rotating keys within each pool on failure.
-// A 429 or timeout marks the current key as failed and rotates to the next key
-// (or next provider) before the next attempt — no manual intervention needed.
-//
-// Arguments:
-//   pools      – { google: KeyPool, openrouter: KeyPool, sambanova: KeyPool, cloudflare: KeyPool }
-//   models     – { google: { fast, quality }, openrouter: { fast, quality }, … }
-//   accountIds – { cloudflare: '<CF account id>' }
-//   tier       – 'fast' | 'quality'
-//
-// Provider priority:
-//   fast    → SambaNova (speed) → Google → OpenRouter → Cloudflare
-//   quality → Google → OpenRouter → SambaNova → Cloudflare
-//
 export async function pooledComplete({
-  pools,
-  models,
-  accountIds = {},
-  tier = 'fast',
-  system,
-  user,
-  maxTokens,
+  pools, models, accountIds = {}, tier = 'fast', system, user, maxTokens, json = false,
 }) {
-  const ORDER =
-    tier === 'fast'
-      ? ['sambanova', 'google', 'openrouter', 'cloudflare']
-      : ['google', 'openrouter', 'sambanova', 'cloudflare'];
+  const order = tier === 'fast'
+    ? ['sambanova', 'google', 'openrouter', 'cloudflare']
+    : ['google', 'openrouter', 'sambanova', 'cloudflare'];
+  const available = order.filter((provider) => pools[provider]?.size > 0);
+  if (!available.length) throw new LLMError('AI rewriting is not configured on this server.', 'no_keys', 503);
 
-  const available = ORDER.filter((p) => pools[p] && pools[p].size > 0);
-
-  if (!available.length) {
-    throw new LLMError('No API keys configured for any provider.', 'no_keys', 500);
-  }
-
-  let lastError = null;
-
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    // Spread attempts across providers so a single slow provider doesn't block all retries
+  const limits = requestLimits();
+  const deadline = Date.now() + limits.total;
+  let lastError;
+  for (let attempt = 0; attempt < limits.attempts; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
     const provider = available[attempt % available.length];
     const pool = pools[provider];
     const model = models[provider]?.[tier];
-
     if (!model) {
-      lastError = new LLMError(`No model configured for ${provider}/${tier}`, 'no_model', 500);
+      lastError = new LLMError('The server has no model configured for this stage.', 'no_model', 503);
       continue;
     }
-
     const key = pool.next();
-    if (!key) continue;
-
+    const options = { key, model, system, user, maxTokens, json, timeout: Math.min(remaining, limits.timeout) };
+    const started = Date.now();
     try {
-      const started = Date.now();
       let result;
-
-      if (provider === 'google') {
-        result = await callGoogle({ key, model, system, user, maxTokens });
-      } else if (provider === 'openrouter') {
-        result = await callOpenRouter({ key, model, system, user, maxTokens });
-      } else if (provider === 'sambanova') {
-        result = await callSambaNova({ key, model, system, user, maxTokens });
-      } else if (provider === 'cloudflare') {
-        result = await callCloudflare({
-          key,
-          model,
-          system,
-          user,
-          maxTokens,
-          accountId: accountIds.cloudflare,
-        });
-      }
-
+      if (provider === 'google') result = await callGoogle(options);
+      else if (provider === 'cloudflare') result = await callCloudflare({ ...options, accountId: accountIds.cloudflare });
+      else result = await callChat({ ...options, provider });
       pool.markSuccess(key);
       return { ...result, model: `${provider}/${model}`, latencyMs: Date.now() - started };
-    } catch (err) {
+    } catch (error) {
       pool.markFailed(key);
-      // Hard rejection (bad prompt / invalid key) — record and move on, no wait
-      if (err instanceof LLMError && err.code === 'request_rejected') {
-        lastError = err;
-        continue;
-      }
-      // Rate limit / timeout — wait before the next attempt
-      lastError = err;
-      if (attempt < MAX_ATTEMPTS - 1) {
-        await new Promise((r) =>
-          setTimeout(r, BACKOFF_MS[attempt] ?? BACKOFF_MS.at(-1)),
-        );
+      lastError = error instanceof LLMError ? error : new LLMError('The AI request failed.', 'provider_error', 502);
+      if (attempt < limits.attempts - 1 && lastError.code !== 'request_rejected') {
+        const delay = Math.min(250 * (attempt + 1), Math.max(0, deadline - Date.now()));
+        if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
   }
-
-  throw lastError instanceof LLMError
-    ? lastError
-    : new LLMError('All providers failed to respond in time.', 'timeout', 504);
+  throw lastError || new LLMError('The AI request timed out.', 'timeout', 504);
 }
-
-// ─── Legacy single-key callers (backward compat) ──────────────────────────────
-//
-// run-stage.js now wires everything through pooledComplete.
-// These stubs remain so any other route that imports geminiComplete won't break.
-
-export async function geminiComplete({ key, model, system, user, maxTokens }) {
-  const started = Date.now();
-  const result = await callGoogle({ key, model, system, user, maxTokens });
-  return { ...result, model, latencyMs: Date.now() - started };
-}
-
-export const anthropicComplete = geminiComplete;
-
-// ─── JSON stage runner ────────────────────────────────────────────────────────
 
 function extractJson(text) {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const raw = fenced ? fenced[1].trim() : text.trim();
-  return JSON.parse(raw);
+  const fenced = text.match(/^\s*```(?:json)?\s*([\s\S]*?)```\s*$/);
+  const data = JSON.parse(fenced ? fenced[1] : text.trim());
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('Object required');
+  return data;
 }
 
-// Pool-aware JSON runner used by run-stage.js
-export async function runJsonStagePooled({ pools, models, accountIds, tier, system, user, maxTokens }) {
-  const result = await pooledComplete({ pools, models, accountIds, tier, system, user, maxTokens });
+export async function runJsonStagePooled({ validate, ...options }) {
+  const result = await pooledComplete({ ...options, json: true });
   let data;
   try {
     data = extractJson(result.text);
   } catch {
-    throw new LLMError(
-      `Model returned invalid JSON: ${result.text.slice(0, 200)}`,
-      'invalid_json',
-      502,
-    );
+    throw new LLMError('The AI provider returned invalid structured output. Please retry.', 'invalid_json', 502);
   }
-  return {
-    data,
-    usage: { inputTokens: result.inputTokens, outputTokens: result.outputTokens },
-    model: result.model,
-  };
-}
-
-// Legacy single-key JSON runner (kept for backward compat)
-export async function runJsonStage({ key, model, system, user, maxTokens }) {
-  const result = await geminiComplete({ key, model, system, user, maxTokens });
-  let data;
   try {
-    data = extractJson(result.text);
-  } catch {
-    throw new LLMError(
-      `Model returned invalid JSON: ${result.text.slice(0, 200)}`,
-      'invalid_json',
-      502,
-    );
+    if (validate) {
+      const validated = validate(data);
+      if (validated === false) throw new Error('Invalid schema');
+      if (validated && typeof validated === 'object') data = validated;
+    }
+  } catch (error) {
+    if (error instanceof LLMError) throw error;
+    throw new LLMError('The AI response did not meet the required format. Please retry.', 'invalid_schema', 502);
   }
   return {
     data,
@@ -398,37 +278,73 @@ export function wordCount(text) {
 }
 
 export function wrapUserText(text) {
-  return `<text>\n${text}\n</text>`;
+  // Source content cannot close its own data boundary or introduce another tag.
+  const escaped = String(text ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return `<text>\n${escaped}\n</text>`;
 }
 
 export function splitChunks(text, chunkWords = 800) {
-  const paragraphs = String(text || '')
-    .split(/\n{2,}/)
-    .map((p) => p.trim())
-    .filter(Boolean);
+  if (!Number.isSafeInteger(chunkWords) || chunkWords < 1) throw new RangeError('chunkWords must be a positive integer');
+  const source = String(text || '');
+  const words = [...source.matchAll(/\S+/g)];
+  if (!words.length) return [];
+
+  // Treat entire fenced blocks as indivisible source spans. Splitting a fence would
+  // turn its later lines into prose and can change the program being documented.
+  const fences = [];
+  const opening = /^ {0,3}(`{3,}|~{3,})[^\n]*(?:\n|$)/gm;
+  let match;
+  while ((match = opening.exec(source))) {
+    const marker = match[1];
+    const closing = new RegExp(`^ {0,3}${marker[0]}{${marker.length},}[\\t ]*(?:\\r?\\n|$)`, 'gm');
+    closing.lastIndex = opening.lastIndex;
+    const close = closing.exec(source);
+    const end = close ? closing.lastIndex : source.length;
+    const content = source.slice(match.index, end);
+    if (wordCount(content) > chunkWords) {
+      throw new LLMError('A fenced code block is too large to rewrite safely. Shorten the code block or process it separately.', 'code_block_too_large', 413);
+    }
+    fences.push({ start: match.index, end });
+    opening.lastIndex = end;
+  }
 
   const chunks = [];
-  let current = [];
-  let currentWords = 0;
-
-  for (const para of paragraphs) {
-    const paraWords = wordCount(para);
-    if (currentWords + paraWords > chunkWords && current.length > 0) {
-      chunks.push(current.join('\n\n'));
-      current = [para];
-      currentWords = paraWords;
-    } else {
-      current.push(para);
-      currentWords += paraWords;
+  let cursor = 0;
+  let wordIndex = 0;
+  while (cursor < source.length) {
+    while (wordIndex < words.length && words[wordIndex].index < cursor) wordIndex++;
+    const nextIndex = wordIndex + chunkWords;
+    let end = nextIndex < words.length ? words[nextIndex].index : source.length;
+    if (end < source.length) {
+      // Prefer an existing paragraph or line boundary, then a sentence boundary.
+      // Slice the original text rather than rebuilding words: keep every space,
+      // line break, heading, list marker, and code character in the source span.
+      const minimum = words[Math.min(words.length - 1, wordIndex + Math.floor(chunkWords / 2))].index;
+      const paragraph = source.lastIndexOf('\n\n', end - 1);
+      const line = source.lastIndexOf('\n', end - 1);
+      if (paragraph >= minimum) end = paragraph + 2;
+      else if (line >= minimum) end = line + 1;
+      else {
+        for (let index = nextIndex - 1; index >= wordIndex + Math.floor(chunkWords / 2); index--) {
+          if (/[.!?]["'’”)]?$/.test(words[index][0])) {
+            end = words[index + 1]?.index ?? source.length;
+            break;
+          }
+        }
+      }
+      const containing = fences.find((fence) => fence.start < end && fence.end > end);
+      if (containing) {
+        // If the code starts this chunk it fits by the check above; otherwise
+        // leave the complete code block for the following chunk.
+        end = containing.start > cursor ? containing.start : containing.end;
+      }
     }
+    if (end <= cursor) throw new LLMError('This document cannot be divided safely.', 'invalid_chunk_boundary', 422);
+    const chunk = source.slice(cursor, end);
+    chunks.push({ index: chunks.length, text: chunk, words: wordCount(chunk), start: cursor, end });
+    cursor = end;
   }
-  if (current.length > 0) chunks.push(current.join('\n\n'));
-
-  return chunks.map((chunkText, index) => ({
-    index,
-    text: chunkText,
-    words: wordCount(chunkText),
-  }));
+  return chunks;
 }
 
 // ─── Cost estimation ──────────────────────────────────────────────────────────
@@ -475,8 +391,13 @@ export function auditProblems(audit) {
   if (!audit) return [];
   const flags = [];
   for (const item of audit.items || []) {
-    if (item.status === 'altered' || item.status === 'missing') {
+    if (['altered', 'missing', 'added'].includes(item.status)) {
       flags.push({ kind: item.kind, value: item.value, status: item.status, note: item.note });
+    }
+  }
+  for (const item of audit.deterministic?.failed || []) {
+    if (!flags.some((flag) => flag.kind === item.kind && flag.value === item.value)) {
+      flags.push({ ...item, status: item.status || 'missing' });
     }
   }
   for (const item of audit.certainty || []) {
@@ -505,31 +426,56 @@ export function summarizeAudit(audit) {
 
 // ─── Deterministic checks ─────────────────────────────────────────────────────
 
-export function deterministicChecks(extraction, rewritten) {
-  if (!extraction || !rewritten) return { passed: [], failed: [] };
+function normalizeLiteral(value) {
+  return String(value ?? '').normalize('NFKC').replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/\s+/g, ' ').trim();
+}
+
+function escapePattern(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function containsLiteral(text, value, caseSensitive = false) {
+  const pattern = escapePattern(value);
+  // Boundaries avoid falsely preserving e.g. "12" when the rewrite says "120".
+  const numeric = /^[-+]?\d/.test(value);
+  const before = numeric ? '[\\p{L}\\p{N}.,+\\-]' : '[\\p{L}\\p{N}]';
+  const after = numeric ? '[\\p{L}\\p{N}%]|[.,]\\d' : '[\\p{L}\\p{N}]';
+  return new RegExp(`(?<!${before})${pattern}(?!${after})`, caseSensitive ? 'u' : 'iu').test(text);
+}
+
+export function deterministicChecks(extraction, rewritten, source) {
   const passed = [];
   const failed = [];
-  const text = rewritten.toLowerCase();
+  const text = normalizeLiteral(rewritten);
+  if (!extraction || !text) return { passed, failed };
+  const check = (kind, value, caseSensitive = false) => {
+    const literal = normalizeLiteral(value);
+    if (!literal) return;
+    const found = containsLiteral(text, literal, caseSensitive);
+    (found ? passed : failed).push({
+      kind, value: literal,
+      ...(!found ? { status: 'missing', note: 'The complete original value was not found in the rewrite. Review it against the source.' } : {}),
+    });
+  };
+  for (const number of extraction.numbers || []) check('number', number.value);
+  for (const quote of extraction.quotations || []) check('quotation', quote.text, true);
+  for (const entity of extraction.named_entities || []) check('entity', entity.name);
+  for (const citation of extraction.citations || []) check('citation', citation.text);
 
-  for (const num of extraction.numbers || []) {
-    const val = String(num.value || '').trim();
-    if (!val) continue;
-    if (text.includes(val.toLowerCase())) {
-      passed.push({ kind: 'number', value: val });
-    } else {
-      failed.push({ kind: 'number', value: val, note: 'Not found verbatim in rewrite' });
+  if (source) {
+    const original = normalizeLiteral(source);
+    // Independently inspect numeric tokens rather than trusting the model's extraction.
+    const numbers = (value) => [...value.matchAll(/(?<![\p{L}\p{N}])[-+]?\d+(?:[.,]\d+)*(?:%|\b)/gu)].map((match) => match[0]);
+    for (const value of new Set(numbers(original))) {
+      if (!containsLiteral(text, value) && !failed.some((item) => item.kind === 'number' && item.value === value)) {
+        failed.push({ kind: 'number', value, status: 'missing', note: 'A number in the original is absent from the rewrite.' });
+      }
+    }
+    for (const value of new Set(numbers(text))) {
+      if (!containsLiteral(original, value)) {
+        failed.push({ kind: 'number', value, status: 'added', note: 'A number in the rewrite does not appear in the original.' });
+      }
     }
   }
-
-  for (const quote of extraction.quotations || []) {
-    const snippet = String(quote.text || '').slice(0, 40).toLowerCase();
-    if (!snippet) continue;
-    if (text.includes(snippet)) {
-      passed.push({ kind: 'quotation', value: snippet });
-    } else {
-      failed.push({ kind: 'quotation', value: snippet, note: 'Quotation may have been altered' });
-    }
-  }
-
   return { passed, failed };
 }

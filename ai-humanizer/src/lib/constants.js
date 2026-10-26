@@ -25,7 +25,7 @@ export const LENGTH_OPTIONS = [
 ];
 
 export const RETENTION_OPTIONS = [
-  { value: 0, label: 'Delete as soon as I close the result', note: 'Nothing is saved to history.' },
+  { value: 0, label: 'Do not save to history', note: 'Kept only while this page is open.' },
   { value: 7, label: 'Keep for 7 days', note: '' },
   { value: 30, label: 'Keep for 30 days', note: 'Default.' },
   { value: 90, label: 'Keep for 90 days', note: '' },
@@ -44,8 +44,8 @@ export const STAGE_LABELS = {
   extract: 'Extracting claims, numbers, names and citations',
   diagnose: 'Diagnosing AI patterns and planning the rewrite',
   rewrite: 'Rewriting paragraph by paragraph',
-  assemble: 'Stitching sections and checking terminology',
-  audit: 'Auditing every claim against the original',
+  assemble: 'Joining rewritten sections in their original order',
+  audit: 'Checking claims against the original',
   repair: 'Repairing flagged items',
   finalize: 'Writing the audit report',
 };

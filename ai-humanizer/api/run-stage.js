@@ -1,613 +1,247 @@
-/**
- * Vercel serverless function — replaces the Base44 runRewriteStage function.
- * POST /api/run-stage
- * Body: { job: <RewriteJob object>, stage: string, chunk_index?: number }
- * Returns: updated job fields + stage metadata
- *
- * The job object is passed in from the client (stored in localStorage) and
- * the patched fields are returned for the client to merge back into its store.
- */
-
+/** Stateless rewrite stages. Provider credentials stay on the server. */
+import { createHash } from 'node:crypto';
+import { z } from 'zod';
+import { getProviderConfig } from './_config.js';
+import { guardApiRequest } from './_security.js';
 import {
-  auditProblems,
-  deterministicChecks,
-  estimateCost,
-  intentCheck,
-  KeyPool,
-  pooledComplete,
-  runJsonStagePooled,
-  splitChunks,
-  summarizeAudit,
-  wordCount,
-  wrapUserText,
+  auditProblems, deterministicChecks, estimateCost, intentCheck, LLMError,
+  pooledComplete, runJsonStagePooled, splitChunks, summarizeAudit, wordCount, wrapUserText,
 } from './_pipeline.js';
+import { AI_PATTERN_CATALOG, PROMPTS, REWRITE_SYSTEM, STAGE_SCHEMAS, STYLE_MODULES } from './_prompts.js';
 
-import {
-  AI_PATTERN_CATALOG,
-  PROMPTS,
-  REWRITE_SYSTEM,
-  STYLE_MODULES,
-} from './_prompts.js';
+const VERSION = 'humanizer/3.0.0';
+const CHUNK_WORDS = 800;
+const STAGES = ['extract', 'diagnose', 'rewrite', 'assemble', 'audit', 'repair', 'finalize'];
+const requestSchema = z.object({
+  stage: z.enum(STAGES), chunk_index: z.number().int().nonnegative().default(0),
+  job: z.object({
+    source_text: z.string().trim().min(1).max(120000),
+    style: z.enum(['professional_researcher', 'casual_blogger', 'technical_writer', 'custom']).default('professional_researcher'),
+    custom_style: z.string().max(2000).default(''), purpose: z.string().max(2000).default(''),
+    length_target: z.enum(['shorter', 'same', 'longer']).default('same'),
+    preserve_headings: z.boolean().default(true), preserve_lists: z.boolean().default(true),
+    input_tokens: z.number().finite().nonnegative().default(0), output_tokens: z.number().finite().nonnegative().default(0),
+    cost_estimate: z.number().finite().nonnegative().default(0), repair_loops: z.number().int().min(0).max(2).default(0),
+    rewritten_text: z.string().max(120000).optional(), notes: z.string().max(200000).optional(),
+    chunks: z.array(z.object({ index: z.number().int().nonnegative(), text: z.string().max(30000), source_words: z.number().int().nonnegative() })).max(200).optional(),
+  }).passthrough(),
+});
 
-const COST_GUARD =
-  'Cost guard: this job passed the per-job token ceiling and was stopped. Shorten the input or raise MAX_JOB_TOKENS in your environment.';
-
-function round6(v) {
-  return Math.round((Number(v) || 0) * 1e6) / 1e6;
+const hash = (value) => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
+const jobFingerprint = (job) => hash([VERSION, job.source_text, job.style, job.custom_style, job.purpose, job.length_target, job.preserve_headings, job.preserve_lists]);
+const appendNote = (old, line) => [old, line].filter(Boolean).join('\n');
+const constraints = (job) => `Preserve headings: ${job.preserve_headings}; preserve lists: ${job.preserve_lists}; length target: ${job.length_target}. Facts and meaning always take priority over length and style.`;
+function requireState(condition, message) {
+  if (!condition) throw new LLMError(message, 'invalid_stage_state', 409);
 }
-
-function mergeUsage(job, usage, tier) {
+function parseStage(stage, data) {
+  const parsed = STAGE_SCHEMAS[stage].safeParse(data);
+  if (!parsed.success) throw new LLMError('The AI response did not match the required structure. Please retry this stage.', 'invalid_schema', 502);
+  return parsed.data;
+}
+function usage(job, result, tier) {
   return {
-    input_tokens: (job.input_tokens || 0) + (usage?.inputTokens || 0),
-    output_tokens: (job.output_tokens || 0) + (usage?.outputTokens || 0),
-    cost_estimate: round6((job.cost_estimate || 0) + estimateCost(usage, tier)),
+    input_tokens: job.input_tokens + (result?.inputTokens || 0),
+    output_tokens: job.output_tokens + (result?.outputTokens || 0),
+    cost_estimate: Math.round((job.cost_estimate + estimateCost(result, tier)) * 1e6) / 1e6,
   };
 }
-
-function appendNote(existing, line) {
-  return [existing, line].filter(Boolean).join('\n');
+function extractionItems(extraction) {
+  return [
+    ...extraction.claims.map((x) => ({ source_id: x.source_id, kind: 'claim', value: x.text })),
+    ...extraction.numbers.map((x) => ({ source_id: x.source_id, kind: 'number', value: x.value })),
+    ...extraction.named_entities.map((x) => ({ source_id: x.source_id, kind: 'entity', value: x.name })),
+    ...extraction.citations.map((x) => ({ source_id: x.source_id, kind: 'citation', value: x.text })),
+    ...extraction.quotations.map((x) => ({ source_id: x.source_id, kind: 'quotation', value: x.text })),
+  ];
 }
-
-function constraintsLine(job) {
-  return `Formatting constraints - preserve headings: ${
-    job.preserve_headings === false ? 'no' : 'yes'
-  }; preserve lists: ${job.preserve_lists === false ? 'no' : 'yes'}; length target: ${
-    job.length_target || 'same'
-  }.`;
-}
-
-function extractionDigest(extraction) {
-  return JSON.stringify({
-    claims: (extraction?.claims || []).map((c) => c.text).slice(0, 60),
-    numbers: (extraction?.numbers || []).map((n) => n.value).slice(0, 80),
-    entities: (extraction?.named_entities || []).map((e) => e.name).slice(0, 80),
-    citations: (extraction?.citations || []).map((c) => c.text).slice(0, 40),
-    quotations: (extraction?.quotations || []).map((q) => q.text).slice(0, 40),
-    hedges: (extraction?.hedge_markers || []).map((h) => h.text).slice(0, 60),
+function validateExtraction(data, source) {
+  const parsed = parseStage('extract', data);
+  let cursor = 0;
+  const paragraphs = source.split(/\n{2,}/).map((text) => {
+    const start = source.indexOf(text, cursor);
+    cursor = start + text.length;
+    return { text, start };
   });
+  const fields = { claims: 'text', numbers: 'value', named_entities: 'name', citations: 'text', quotations: 'text', hedge_markers: 'text' };
+  for (const [category, field] of Object.entries(fields)) {
+    const occurrences = new Map();
+    parsed[category] = parsed[category].map((item, index) => {
+      const paragraph = paragraphs[item.paragraph];
+      const key = JSON.stringify([item.paragraph, item[field]]);
+      const offset = paragraph?.text.indexOf(item[field], occurrences.get(key) || 0) ?? -1;
+      if (offset < 0) throw new LLMError('The extraction contained an invalid source span or paragraph. Please retry.', 'invalid_extraction', 502);
+      occurrences.set(key, offset + item[field].length);
+      return { ...item, source_id: `${category}:${index}`, source_start: paragraph.start + offset, source_end: paragraph.start + offset + item[field].length };
+    });
+  }
+  return parsed;
 }
-
-function lastWords(text, count) {
-  const words = String(text || '').trim().split(/\s+/);
-  return words.slice(Math.max(0, words.length - count)).join(' ');
+function validateAudit(data, extraction) {
+  const parsed = parseStage('audit', data);
+  const expected = new Map(extractionItems(extraction).map((item) => [item.source_id, item]));
+  const checked = new Set();
+  for (const item of parsed.items) {
+    if (item.status === 'added') {
+      if (item.source_id !== null) throw new LLMError('Added audit findings must be separate from original source items.', 'incomplete_audit', 502);
+      continue;
+    }
+    const original = expected.get(item.source_id);
+    if (!original || original.kind !== item.kind || original.value !== item.value || checked.has(item.source_id)) {
+      throw new LLMError('The audit did not match each original fact exactly once. Please retry the audit.', 'incomplete_audit', 502);
+    }
+    checked.add(item.source_id);
+  }
+  const hedges = new Map(extraction.hedge_markers.map((item) => [item.source_id, item.text]));
+  const certaintyChecked = new Set();
+  for (const item of parsed.certainty) {
+    if (item.source_id === null && item.status !== 'none') continue;
+    if (hedges.get(item.source_id) !== item.marker || certaintyChecked.has(item.source_id)) throw new LLMError('The audit did not match each certainty marker exactly once. Please retry the audit.', 'incomplete_audit', 502);
+    certaintyChecked.add(item.source_id);
+  }
+  if (checked.size !== expected.size || certaintyChecked.size !== hedges.size) throw new LLMError('The audit did not cover every extracted fact and certainty marker. Please retry the audit.', 'incomplete_audit', 502);
+  return parsed;
+}
+function sectionFacts(extraction, chunk) {
+  return Object.fromEntries(Object.entries(extraction).map(([category, items]) => [category, items.filter((item) => item.source_start >= chunk.start && item.source_end <= chunk.end)]));
+}
+function deterministic(job, rewritten) {
+  const checked = deterministicChecks(job.extraction, rewritten, job.source_text);
+  const sourceHeadings = job.source_text.match(/^#{1,6}\s+.+$/gm) || [];
+  const outputHeadings = rewritten.match(/^#{1,6}\s+.+$/gm) || [];
+  if (job.preserve_headings && JSON.stringify(sourceHeadings) !== JSON.stringify(outputHeadings)) {
+    checked.failed.push({ kind: 'format', value: 'Headings', note: 'Markdown headings or their order changed.' });
+  }
+  if (job.preserve_lists) {
+    const markers = (value) => (value.match(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/gm) || []).map((x) => x.trim());
+    if (JSON.stringify(markers(job.source_text)) !== JSON.stringify(markers(rewritten))) checked.failed.push({ kind: 'format', value: 'Lists', note: 'List markers, item count, or numbering changed.' });
+  }
+  const blocks = (value) => value.match(/```[^\n]*\n[\s\S]*?```/g) || [];
+  if (JSON.stringify(blocks(job.source_text)) !== JSON.stringify(blocks(rewritten))) checked.failed.push({ kind: 'format', value: 'Code blocks', note: 'A fenced code block changed.' });
+  return checked;
 }
 
 export default async function handler(req, res) {
+  res.setHeader?.('Cache-Control', 'no-store');
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
+    res.setHeader?.('Allow', 'POST');
+    return res.status(405).json({ error: 'Method not allowed', code: 'method_not_allowed' });
   }
-
-  // ── API key pools ──────────────────────────────────────────────────────────
-  // Each provider accepts up to 3 keys (KEY_1 / KEY_2 / KEY_3).
-  // Keys that are missing or empty are silently skipped.
-  // At least one provider must have a key or the handler returns 500.
-
-  const pools = {
-    google: new KeyPool([
-      process.env.GOOGLE_API_KEY_1 || process.env.GOOGLE_API_KEY,
-      process.env.GOOGLE_API_KEY_2,
-      process.env.GOOGLE_API_KEY_3,
-    ]),
-    openrouter: new KeyPool([
-      process.env.OPENROUTER_API_KEY_1,
-      process.env.OPENROUTER_API_KEY_2,
-      process.env.OPENROUTER_API_KEY_3,
-    ]),
-    sambanova: new KeyPool([
-      process.env.SAMBANOVA_API_KEY_1,
-      process.env.SAMBANOVA_API_KEY_2,
-      process.env.SAMBANOVA_API_KEY_3,
-    ]),
-    cloudflare: new KeyPool([
-      process.env.CLOUDFLARE_API_KEY_1,
-      process.env.CLOUDFLARE_API_KEY_2,
-      process.env.CLOUDFLARE_API_KEY_3,
-    ]),
-  };
-
-  const totalKeys = Object.values(pools).reduce((sum, p) => sum + p.size, 0);
-  if (totalKeys === 0) {
-    return res.status(500).json({
-      error:
-        'No API keys configured. Add at least GOOGLE_API_KEY_1 (or GOOGLE_API_KEY) to your environment variables.',
-    });
-  }
-
-  // ── Model IDs per provider / tier ─────────────────────────────────────────
-  // Override any of these via environment variables if needed.
-  const models = {
-    google: {
-      fast:    process.env.GOOGLE_MODEL_FAST    || 'gemini-3.8-flash',
-      quality: process.env.GOOGLE_MODEL_QUALITY || 'gemini-2.5-pro',
-    },
-    openrouter: {
-      fast:    process.env.OPENROUTER_MODEL_FAST    || 'google/gemini-3.8-flash',
-      quality: process.env.OPENROUTER_MODEL_QUALITY || 'google/gemini-2.5-pro',
-    },
-    sambanova: {
-      fast:    process.env.SAMBANOVA_MODEL_FAST    || 'Meta-Llama-3.3-70B-Instruct',
-      quality: process.env.SAMBANOVA_MODEL_QUALITY || 'Meta-Llama-3.3-70B-Instruct',
-    },
-    cloudflare: {
-      fast:    process.env.CLOUDFLARE_MODEL_FAST    || '@cf/meta/llama-3.1-8b-instruct',
-      quality: process.env.CLOUDFLARE_MODEL_QUALITY || '@cf/meta/llama-3.1-70b-instruct',
-    },
-  };
-
-  const accountIds = {
-    cloudflare: process.env.CLOUDFLARE_ACCOUNT_ID,
-  };
-
-  const maxInputChars  = Number(process.env.MAX_INPUT_CHARS) || 120000; // raised to support 20k words (~120k chars)
-  const maxJobTokens   = Number(process.env.MAX_JOB_TOKENS)  || 400000; // raised for parallel multi-chunk jobs
-  const CHUNK_WORDS    = 4000; // each parallel worker gets ~4k words
-  const maxRepairLoops = 2;
-  const promptVersion  = 'humanizer/1.0.0';
-
-  // ── Convenience wrappers ──────────────────────────────────────────────────
-  // llm.fast / llm.quality mirror the old API so all stage code below is
-  // unchanged — they just route through the pool instead of a single key.
-  const llm = {
-    fast: (opts) => {
-      if (opts.json) {
-        return runJsonStagePooled({ pools, models, accountIds, tier: 'fast', ...opts });
-      }
-      return pooledComplete({ pools, models, accountIds, tier: 'fast', ...opts });
-    },
-    quality: (opts) => {
-      if (opts.json) {
-        return runJsonStagePooled({ pools, models, accountIds, tier: 'quality', ...opts });
-      }
-      return pooledComplete({ pools, models, accountIds, tier: 'quality', ...opts });
-    },
-  };
-
-  let body;
+  let input;
+  try { input = typeof req.body === 'string' ? JSON.parse(req.body) : req.body; }
+  catch { return res.status(400).json({ error: 'Invalid JSON body', code: 'invalid_request' }); }
+  const parsed = requestSchema.safeParse(input);
+  if (!parsed.success) return res.status(400).json({ error: 'Provide a valid job, source text, stage, and rewrite settings.', code: 'invalid_request' });
+  const { job, stage, chunk_index: chunkIndex } = parsed.data;
+  if (!await guardApiRequest(req, res, { billable: ['extract', 'diagnose', 'rewrite', 'audit', 'repair'].includes(stage) })) return;
+  const config = getProviderConfig();
+  if (job.source_text.length > config.maxInputChars) return res.status(413).json({ error: `The document exceeds the ${config.maxInputChars.toLocaleString()} character limit.`, code: 'input_too_large' });
+  const fingerprint = jobFingerprint(job);
   try {
-    body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-  } catch {
-    return res.status(400).json({ error: 'Invalid JSON body' });
-  }
-
-  const { job: rawJob, stage, chunk_index: chunkIndex = 0 } = body || {};
-
-  if (!rawJob || !stage) {
-    return res.status(400).json({ error: 'job and stage are required' });
-  }
-
-  // Work on a mutable copy; we return only the patched fields
-  const job = { ...rawJob };
-
-  // Cost guard
-  if ((job.input_tokens || 0) + (job.output_tokens || 0) > maxJobTokens) {
-    return res.status(200).json({
-      stage,
-      error: COST_GUARD,
-      patch: { status: 'failed', error: COST_GUARD },
+    if (job.input_tokens + job.output_tokens >= config.maxJobTokens) throw new LLMError('This job reached its token limit. Shorten the document and start a new rewrite.', 'token_limit', 422);
+    const refusal = intentCheck(job.purpose, job.custom_style);
+    if (refusal.blocked) return res.json({ stage, refused: true, reason: refusal.reason, patch: { status: 'refused', error: refusal.reason } });
+    if (stage !== 'extract') {
+      requireState(job.pipeline_fingerprint === fingerprint, 'The source or rewrite settings changed. Start again with extraction.');
+      job.extraction = validateExtraction(job.extraction, job.source_text);
+    }
+    const sourceChunks = splitChunks(job.source_text, CHUNK_WORDS);
+    if (['rewrite', 'assemble', 'audit', 'repair', 'finalize'].includes(stage)) {
+      requireState(STAGE_SCHEMAS.diagnose.safeParse(job.diagnosis).success, 'Run the diagnostic stage before rewriting.');
+      requireState(job.chunks?.length === sourceChunks.length && job.chunks.every((chunk, i) => chunk.index === i && chunk.source_words === sourceChunks[i].words), 'The section state is incomplete. Start a new rewrite.');
+    }
+    if (['audit', 'repair', 'finalize'].includes(stage)) {
+      requireState(job.consistency_done && job.rewritten_text?.trim() && job.chunks.every((chunk) => chunk.text.trim()), 'Assemble every rewritten section before auditing.');
+    }
+    // Deterministic stages do not need a live provider; generation stages do.
+    if (!config.configured && ['extract', 'diagnose', 'rewrite', 'audit', 'repair'].includes(stage)) throw new LLMError('AI rewriting is not configured. The site administrator must add a provider API key on the server.', 'provider_not_configured', 503);
+    const providerArgs = { pools: config.pools, models: config.models, accountIds: config.accountIds };
+    const jsonStage = (name, user, tier = 'fast', validator = (data) => parseStage(name, data)) => runJsonStagePooled({
+      ...providerArgs, tier, system: PROMPTS[name].system, user, maxTokens: PROMPTS[name].maxTokens, validate: validator,
     });
-  }
-
-  try {
-    // ── EXTRACT ────────────────────────────────────────────────────────────────
     if (stage === 'extract') {
-      if (job.extraction && Array.isArray(job.chunks) && job.chunks.length) {
-        return res.json({ stage, cached: true, chunk_count: job.chunks.length, progress: job.progress || 15, patch: {} });
-      }
-
-      const source = String(job.source_text || '').trim();
-      if (!source) {
-        return res.json({ stage, error: 'There is no text to rewrite.', patch: { status: 'failed', error: 'There is no text to rewrite.' } });
-      }
-      if (source.length > maxInputChars) {
-        const error = `This document is ${source.length.toLocaleString()} characters; the limit is ${maxInputChars.toLocaleString()}.`;
-        return res.json({ stage, error, patch: { status: 'failed', error } });
-      }
-
-      const refusal = intentCheck(job.purpose, job.custom_style);
-      if (refusal.blocked) {
-        return res.json({ stage, refused: true, reason: refusal.reason, patch: { status: 'refused', stage, progress: 0, error: refusal.reason } });
-      }
-
-      const chunks = splitChunks(source, CHUNK_WORDS);
-      const result = await llm.fast({
-        json: true,
-        system: PROMPTS.extract.system,
-        user: `${wrapUserText(source)}\n\nReturn the extraction JSON for the text above.`,
-        maxTokens: PROMPTS.extract.maxTokens,
-        cache: true,
-      });
-
-      const patch = {
-        ...mergeUsage(job, result.usage, 'fast'),
-        extraction: result.data,
-        chunks: chunks.map((c) => ({ index: c.index, text: '', source_words: c.words })),
-        source_words: wordCount(source),
-        status: 'running',
-        stage,
-        progress: 15,
-        prompt_version: promptVersion,
-        error: '',
-      };
-      return res.json({ stage, chunk_count: chunks.length, progress: 15, patch });
+      if (job.pipeline_fingerprint === fingerprint && STAGE_SCHEMAS.extract.safeParse(job.extraction).success && job.chunks?.length === sourceChunks.length) return res.json({ stage, cached: true, chunk_count: job.chunks.length, progress: 15, patch: {} });
+      const result = await jsonStage('extract', `${wrapUserText(job.source_text)}\nExtract every load-bearing fact.`, 'fast', (data) => validateExtraction(data, job.source_text));
+      return res.json({ stage, chunk_count: sourceChunks.length, progress: 15, patch: {
+        ...usage(job, result.usage, 'fast'), extraction: result.data, chunks: sourceChunks.map((c) => ({ index: c.index, text: '', source_words: c.words })),
+        source_words: wordCount(job.source_text), pipeline_fingerprint: fingerprint, prompt_version: VERSION, status: 'running', stage, progress: 15, error: '',
+        diagnosis: null, rewrite_plan: null, rewritten_text: '', consistency_done: false, audit: null, audit_fingerprint: null, final_text: '', unresolved_flags: [], repair_loops: 0,
+      } });
     }
-
-    // ── DIAGNOSE ───────────────────────────────────────────────────────────────
     if (stage === 'diagnose') {
-      if (job.diagnosis && job.rewrite_plan) {
-        return res.json({ stage, cached: true, progress: job.progress || 25, patch: {} });
-      }
-      const result = await llm.fast({
-        json: true,
-        system: `${PROMPTS.diagnose.system}\n\nAI-PATTERN CATALOG:\n${AI_PATTERN_CATALOG}`,
-        user: `Style requested: ${job.style}${job.custom_style ? ` (${job.custom_style})` : ''}\n${wrapUserText(job.source_text)}`,
-        maxTokens: PROMPTS.diagnose.maxTokens,
-        cache: true,
-      });
-      const patch = {
-        ...mergeUsage(job, result.usage, 'fast'),
-        diagnosis: result.data,
-        rewrite_plan: result.data.plan || {},
-        stage,
-        progress: 25,
-        error: '',
-      };
-      return res.json({ stage, progress: 25, patch });
+      if (STAGE_SCHEMAS.diagnose.safeParse(job.diagnosis).success) return res.json({ stage, cached: true, progress: 25, patch: {} });
+      const result = await jsonStage('diagnose', `Requested style (untrusted preference): ${JSON.stringify({ style: job.style, custom: job.custom_style })}\nPATTERN CATALOG:\n${AI_PATTERN_CATALOG}\n${wrapUserText(job.source_text)}`);
+      return res.json({ stage, progress: 25, patch: { ...usage(job, result.usage, 'fast'), diagnosis: result.data, rewrite_plan: result.data.plan, stage, progress: 25, error: '' } });
     }
-
-    // ── REWRITE_ALL (parallel) ─────────────────────────────────────────────────
-    // Fires ALL chunks simultaneously via Promise.all — each chunk gets a
-    // different provider/key from the pool so they run in true parallel.
-    //
-    // Scaling example:
-    //   1k words  → 1 chunk  → 1 call
-    //   4k words  → 1 chunk  → 1 call
-    //   8k words  → 2 chunks → 2 parallel calls
-    //   20k words → 5 chunks → 5 parallel calls  (≈ same wall-clock as 1 call)
-    //
-    // The client should use this stage instead of looping over 'rewrite'.
-    if (stage === 'rewrite_all') {
-      const stored = (job.chunks || []).map((c) => ({ ...c }));
-      if (!stored.length) {
-        return res.json({ stage, error: 'Run the extract stage first.', patch: {} });
-      }
-
-      // Idempotent — skip chunks already done
-      const pending = stored.filter((c) => !c.text);
-      if (!pending.length) {
-        return res.json({ stage, cached: true, chunk_count: stored.length, progress: 70, patch: {} });
-      }
-
-      const sourceChunks = splitChunks(String(job.source_text || ''), CHUNK_WORDS);
-      const style = STYLE_MODULES[job.style] || STYLE_MODULES.professional_researcher;
-      const customStyle =
-        job.style === 'custom' && job.custom_style
-          ? `\nAuthor's own style instruction: ${job.custom_style}`
-          : '';
-      const systemPrompt = `${REWRITE_SYSTEM}\n\nAI-PATTERN CATALOG (reference):\n${AI_PATTERN_CATALOG}`;
-
-      // Build one async call per pending chunk — all kicked off simultaneously
-      const chunkCalls = pending.map((chunk) => {
-        const srcChunk = sourceChunks[chunk.index];
-        if (!srcChunk) {
-          return Promise.resolve({ index: chunk.index, text: '', error: 'Source chunk missing' });
-        }
-
-        const prevText = stored
-          .slice(Math.max(0, chunk.index - 2), chunk.index)
-          .filter((c) => c.text)
-          .map((c) => lastWords(c.text, 80));
-
-        const userPrompt = [
-          `STYLE MODULE (${job.style}):\n${style}${customStyle}`,
-          constraintsLine(job),
-          `REWRITE PLAN (diagnostic stage):\n${JSON.stringify(job.rewrite_plan || {})}`,
-          `MUST SURVIVE UNCHANGED (extracted from the source):\n${extractionDigest(job.extraction)}`,
-          prevText.length
-            ? `PRECEDING SECTIONS (do not repeat, only continue smoothly):\n${prevText.join('\n---\n')}`
-            : '',
-          `SECTION ${chunk.index + 1} OF ${stored.length}: rewrite the text below, paragraph by paragraph.`,
-          wrapUserText(srcChunk.text),
-        ]
-          .filter(Boolean)
-          .join('\n\n');
-
-        return llm
-          .quality({ system: systemPrompt, user: userPrompt, maxTokens: 8000 })
-          .then((r) => ({
-            index: chunk.index,
-            text: String(r.text || '').trim(),
-            inputTokens: r.inputTokens || 0,
-            outputTokens: r.outputTokens || 0,
-          }))
-          .catch((err) => ({ index: chunk.index, text: '', error: err.message }));
-      });
-
-      // All chunks run in parallel — wall-clock = slowest single chunk
-      const results = await Promise.all(chunkCalls);
-
-      let totalInput = 0;
-      let totalOutput = 0;
-      const errors = [];
-
-      for (const r of results) {
-        if (r.error || !r.text) {
-          errors.push(`Chunk ${r.index + 1}: ${r.error || 'empty response'}`);
-          continue;
-        }
-        stored[r.index] = { ...stored[r.index], text: r.text };
-        totalInput  += r.inputTokens;
-        totalOutput += r.outputTokens;
-      }
-
-      const done = stored.filter((c) => c.text).length;
-
-      if (errors.length && done === 0) {
-        return res.json({
-          stage,
-          error: `All chunks failed: ${errors.join('; ')}`,
-          patch: { status: 'failed', error: errors.join('; ') },
-        });
-      }
-
-      const patch = {
-        ...mergeUsage(job, { inputTokens: totalInput, outputTokens: totalOutput }, 'quality'),
-        chunks: stored,
-        rewritten_text: stored.map((c) => c.text).filter(Boolean).join('\n\n'),
-        stage,
-        progress: 70,
-        ...(errors.length
-          ? { notes: appendNote(job.notes, `Partial rewrite — failed chunks: ${errors.join('; ')}`) }
-          : {}),
-      };
-
-      return res.json({ stage, done, chunk_count: stored.length, failed_chunks: errors.length, progress: 70, patch });
-    }
-
-    // ── REWRITE (single chunk, kept for backward compat) ───────────────────────
     if (stage === 'rewrite') {
-      const stored = (job.chunks || []).map((c) => ({ ...c }));
-      if (!stored.length) {
-        return res.json({ stage, error: 'Run the extract stage first.', patch: {} });
-      }
-      const target = stored[chunkIndex];
-      if (!target) {
-        return res.json({ stage, error: 'That section does not exist.', patch: {} });
-      }
-      if (target.text) {
-        const done = stored.filter((c) => c.text).length;
-        return res.json({ stage, chunk_index: chunkIndex, cached: true, done, chunk_count: stored.length, progress: job.progress || 40, patch: {} });
-      }
-
-      const sourceChunks = splitChunks(String(job.source_text || ''), CHUNK_WORDS);
-      const sourceChunk = sourceChunks[chunkIndex];
-      if (!sourceChunk) {
-        return res.json({ stage, error: 'That section does not exist.', patch: {} });
-      }
-
-      const context = stored
-        .slice(Math.max(0, chunkIndex - 2), chunkIndex)
-        .filter((c) => c.text)
-        .map((c) => lastWords(c.text, 80));
-
-      const style = STYLE_MODULES[job.style] || STYLE_MODULES.professional_researcher;
-      const customStyle =
-        job.style === 'custom' && job.custom_style
-          ? `\nAuthor's own style instruction: ${job.custom_style}`
-          : '';
-
-      const userPrompt = [
-        `STYLE MODULE (${job.style}):\n${style}${customStyle}`,
-        constraintsLine(job),
-        `REWRITE PLAN (diagnostic stage):\n${JSON.stringify(job.rewrite_plan || {})}`,
-        `MUST SURVIVE UNCHANGED (extracted from the source):\n${extractionDigest(job.extraction)}`,
-        context.length
-          ? `PRECEDING SECTIONS (do not repeat, only continue smoothly):\n${context.join('\n---\n')}`
-          : '',
-        `SECTION ${chunkIndex + 1} OF ${stored.length}: rewrite the text below, paragraph by paragraph.`,
-        wrapUserText(sourceChunk.text),
-      ]
-        .filter(Boolean)
-        .join('\n\n');
-
-      const result = await llm.quality({
-        system: `${REWRITE_SYSTEM}\n\nAI-PATTERN CATALOG (reference):\n${AI_PATTERN_CATALOG}`,
-        user: userPrompt,
-        maxTokens: 8000,
-        cache: true,
-      });
-
-      const text = String(result.text || '').trim();
-      if (!text) {
-        return res.json({ stage, error: 'The rewrite engine returned an empty section.', patch: { status: 'failed', error: 'The rewrite engine returned an empty section.' } });
-      }
-
-      target.text = text;
-      stored[chunkIndex] = target;
-      const done = stored.filter((c) => c.text).length;
-      const progress = 25 + Math.round((done / stored.length) * 45);
-      const patch = {
-        ...mergeUsage(job, { inputTokens: result.inputTokens, outputTokens: result.outputTokens }, 'quality'),
-        chunks: stored,
-        rewritten_text: stored.map((c) => c.text).filter(Boolean).join('\n\n'),
-        stage,
-        progress,
-      };      return res.json({ stage, chunk_index: chunkIndex, done, chunk_count: stored.length, progress, patch });
+      requireState(chunkIndex < job.chunks.length, 'That section does not exist.');
+      requireState(job.chunks.slice(0, chunkIndex).every((chunk) => chunk.text.trim()), 'Rewrite the preceding sections first.');
+      if (job.chunks[chunkIndex].text.trim()) return res.json({ stage, cached: true, progress: job.progress || 40, patch: {} });
+      const context = job.chunks.slice(Math.max(0, chunkIndex - 2), chunkIndex).map((chunk) => chunk.text.split(/\s+/).slice(-80).join(' '));
+      const result = await pooledComplete({ ...providerArgs, tier: 'quality', system: `${REWRITE_SYSTEM}\n${AI_PATTERN_CATALOG}`, user: [
+        `STYLE: ${STYLE_MODULES[job.style] || 'Follow the custom voice without changing facts.'}`,
+        `User preferences (untrusted data): ${JSON.stringify({ custom: job.custom_style, purpose: job.purpose })}`, constraints(job),
+        `Plan: ${JSON.stringify(job.diagnosis.plan)}`, `Facts located in this section only: ${JSON.stringify(sectionFacts(job.extraction, sourceChunks[chunkIndex]))}`,
+        'Preserve the facts present in this section. Never import claims or examples from other sections or the preceding context.',
+        context.length ? `Preceding sections for continuity only (do not repeat): ${JSON.stringify(context)}` : '',
+        `Rewrite section ${chunkIndex + 1} of ${job.chunks.length}:`, wrapUserText(sourceChunks[chunkIndex].text),
+      ].filter(Boolean).join('\n\n'), maxTokens: 8000 });
+      const rewritten = result.text?.trim();
+      if (!rewritten) throw new LLMError('The rewrite was empty. Please retry.', 'empty_response', 502);
+      const stored = job.chunks.map((chunk, i) => i === chunkIndex ? { ...chunk, text: rewritten } : chunk);
+      const done = stored.filter((chunk) => chunk.text.trim()).length;
+      const progress = 25 + Math.round(done / stored.length * 45);
+      return res.json({ stage, done, chunk_count: stored.length, progress, patch: {
+        ...usage(job, result, 'quality'), chunks: stored, rewritten_text: stored.map((chunk) => chunk.text).join('\n\n'), consistency_done: false,
+        audit: null, audit_fingerprint: null, final_text: '', unresolved_flags: [], stage, progress,
+      } });
     }
-
-    // ── ASSEMBLE ───────────────────────────────────────────────────────────────
     if (stage === 'assemble') {
-      if (job.consistency_done) {
-        return res.json({ stage, cached: true, progress: job.progress || 75, patch: {} });
-      }
-      const stitched = (job.chunks || []).map((c) => c.text).filter(Boolean).join('\n\n');
-      if (!stitched) {
-        return res.json({ stage, error: 'There are no rewritten sections to stitch yet.', patch: {} });
-      }
-
-      let text = stitched;
-      let edits = [];
-      let usage = null;
-      if ((job.chunks || []).length > 1) {
-        const result = await llm.quality({
-          json: true,
-          system: PROMPTS.consistency.system,
-          user: [
-            constraintsLine(job),
-            `TERMS THAT MUST READ IDENTICALLY THROUGHOUT: ${JSON.stringify(
-              (job.extraction?.named_entities || []).map((e) => e.name).slice(0, 60),
-            )}`,
-            wrapUserText(stitched),
-          ].join('\n\n'),
-          maxTokens: PROMPTS.consistency.maxTokens,
-          cache: true,
-        });
-        text = String(result.data.text || stitched).trim();
-        edits = result.data.edits || [];
-        usage = result.usage;
-      }
-
-      const patch = {
-        ...(usage ? mergeUsage(job, usage, 'quality') : {}),
-        rewritten_text: text,
-        consistency_done: true,
-        consistency_edits: edits,
-        notes: edits.length
-          ? appendNote(job.notes, `Consistency pass touched ${edits.length} seam(s): ${edits.join('; ')}`)
-          : job.notes,
-        stage,
-        progress: 75,
-      };
-      return res.json({ stage, progress: 75, patch });
+      requireState(job.chunks.every((chunk) => chunk.text.trim()), 'Complete every section before assembly.');
+      // Joining completed sections is lossless. A whole-document generative pass can truncate or alter facts.
+      const rewritten = job.chunks.map((chunk) => chunk.text).join('\n\n');
+      return res.json({ stage, progress: 75, patch: { rewritten_text: rewritten, consistency_done: true, consistency_edits: [], audit: null, audit_fingerprint: null, final_text: '', stage, progress: 75 } });
     }
-
-    // ── AUDIT ──────────────────────────────────────────────────────────────────
     if (stage === 'audit') {
-      const rewritten = String(job.rewritten_text || '');
-      if (!rewritten) {
-        return res.json({ stage, error: 'There is nothing to audit yet.', patch: {} });
-      }
-      const deterministic = deterministicChecks(job.extraction, rewritten);
-      const result = await llm.fast({
-        json: true,
-        system: PROMPTS.audit.system,
-        user: [
-          `EXTRACTION FROM THE ORIGINAL (ground truth):\n${JSON.stringify(job.extraction || {})}`,
-          `ALREADY CONFIRMED BY THE DETERMINISTIC PASS IN CODE:\n${JSON.stringify(deterministic)}`,
-          constraintsLine(job),
-          wrapUserText(rewritten),
-        ].join('\n\n'),
-        maxTokens: PROMPTS.audit.maxTokens,
-        cache: true,
-      });
-      const audit = { ...result.data, deterministic };
+      const checked = deterministic(job, job.rewritten_text);
+      const result = await jsonStage('audit', [
+        `FULL ORIGINAL:\n${wrapUserText(job.source_text)}`, `EXTRACTION INDEX:\n${JSON.stringify(job.extraction)}`,
+        `Deterministic checks (cannot be overruled): ${JSON.stringify(checked)}`, constraints(job),
+        `REWRITTEN TEXT:\n${wrapUserText(job.rewritten_text)}`,
+      ].join('\n\n'), 'quality', (data) => validateAudit(data, job.extraction));
+      const audit = { ...result.data, deterministic: checked };
       const flags = auditProblems(audit);
-      const patch = {
-        ...mergeUsage(job, result.usage, 'fast'),
-        audit,
-        unresolved_flags: flags,
-        stage,
-        progress: 85,
-      };
-      return res.json({
-        stage,
-        progress: 85,
-        has_problems: flags.length > 0,
-        flag_count: flags.length,
-        counts: summarizeAudit(audit),
-        patch,
-      });
+      return res.json({ stage, progress: 85, has_problems: flags.length > 0, flag_count: flags.length, counts: summarizeAudit(audit), patch: {
+        ...usage(job, result.usage, 'quality'), audit, audit_fingerprint: hash([fingerprint, job.rewritten_text]), unresolved_flags: flags, stage, progress: 85,
+      } });
     }
-
-    // ── REPAIR ─────────────────────────────────────────────────────────────────
-    if (stage === 'repair') {
-      const flags = auditProblems(job.audit);
-      if (!flags.length) {
-        return res.json({ stage, skipped: true, reason: 'Nothing to repair.', progress: 88, patch: {} });
+    if (stage === 'repair' || stage === 'finalize') {
+      requireState(job.audit_fingerprint === hash([fingerprint, job.rewritten_text]) && STAGE_SCHEMAS.audit.safeParse(job.audit).success, 'Run a fresh audit of the current rewrite first.');
+      validateAudit(job.audit, job.extraction);
+      // Recompute deterministic findings even if a client omitted them from the audit.
+      const audit = { ...job.audit, deterministic: deterministic(job, job.rewritten_text) };
+      const flags = auditProblems(audit);
+      if (stage === 'repair') {
+        if (!flags.length || job.repair_loops >= 2) return res.json({ stage, skipped: true, progress: 90, patch: {} });
+        const result = await jsonStage('repair', [
+          `Flagged findings: ${JSON.stringify(flags)}`, `FULL ORIGINAL:\n${wrapUserText(job.source_text)}`, `Authoritative extraction: ${JSON.stringify(job.extraction)}`,
+          constraints(job), `CURRENT REWRITE:\n${wrapUserText(job.rewritten_text)}`,
+        ].join('\n\n'), 'quality');
+        return res.json({ stage, repaired: true, progress: 88, patch: {
+          ...usage(job, result.usage, 'quality'), rewritten_text: result.data.text, repair_loops: job.repair_loops + 1,
+          audit: null, audit_fingerprint: null, final_text: '', unresolved_flags: [],
+          notes: appendNote(job.notes, `Repair pass ${job.repair_loops + 1}: ${result.data.fixes.map((fix) => `${fix.item}: ${fix.action}`).join('; ') || 'No changes reported.'}`), stage, progress: 88,
+        } });
       }
-      if ((job.repair_loops || 0) >= maxRepairLoops) {
-        return res.json({ stage, skipped: true, reason: 'Repair loop limit reached.', progress: 90, patch: {} });
-      }
-      const result = await llm.quality({
-        json: true,
-        system: PROMPTS.repair.system,
-        user: [
-          `FLAGGED ITEMS - FIX ONLY THESE:\n${JSON.stringify(flags)}`,
-          `FULL EXTRACTION FROM THE ORIGINAL (authoritative values):\n${JSON.stringify(job.extraction || {})}`,
-          constraintsLine(job),
-          wrapUserText(String(job.rewritten_text || '')),
-        ].join('\n\n'),
-        maxTokens: PROMPTS.repair.maxTokens,
-        cache: true,
-      });
-      const fixes = result.data.fixes || [];
-      const summary = fixes.length
-        ? `Repair pass ${(job.repair_loops || 0) + 1}: ${fixes.map((f) => `${f.item} - ${f.action}`).join('; ')}`
-        : `Repair pass ${(job.repair_loops || 0) + 1}: the rewriter left the text unchanged.`;
-      const patch = {
-        ...mergeUsage(job, result.usage, 'quality'),
-        rewritten_text: String(result.data.text || job.rewritten_text || '').trim(),
-        repair_loops: (job.repair_loops || 0) + 1,
-        notes: appendNote(job.notes, summary),
-        stage,
-        progress: 88,
-      };
-      return res.json({ stage, repaired: true, repair_loops: patch.repair_loops, progress: 88, patch });
-    }
-
-    // ── FINALIZE ───────────────────────────────────────────────────────────────
-    if (stage === 'finalize') {
-      const finalText = String(job.rewritten_text || '').trim();
-      if (!finalText) {
-        return res.json({ stage, error: 'The rewrite did not produce any text.', patch: {} });
-      }
-      const flags = auditProblems(job.audit);
-      const counts = summarizeAudit(job.audit);
       const status = flags.length ? 'needs_review' : 'completed';
-
-      const notesLines = [];
-      const diagnosis = job.diagnosis || {};
-      const plan = job.rewrite_plan || {};
-      if (diagnosis.purpose_guess) notesLines.push(`Purpose (inferred): ${diagnosis.purpose_guess}`);
-      if (diagnosis.audience_guess) notesLines.push(`Audience (inferred): ${diagnosis.audience_guess}`);
-      if (plan.register) notesLines.push(`Register: ${plan.register}`);
-      if (plan.target_sentence_length_distribution) {
-        notesLines.push(`Rhythm target: ${plan.target_sentence_length_distribution}`);
-      }
-      if (plan.transition_policy) notesLines.push(`Transitions: ${plan.transition_policy}`);
-      if ((plan.structural_changes || []).length) {
-        notesLines.push(`Structural moves: ${plan.structural_changes.join('; ')}`);
-      }
-      if ((diagnosis.ambiguous_sentences || []).length) {
-        notesLines.push(
-          `Ambiguous in the original, left as written: ${diagnosis.ambiguous_sentences
-            .map((s) => s.sentence)
-            .slice(0, 3)
-            .join(' / ')}`,
-        );
-      }
-      if (flags.length) {
-        notesLines.push(
-          `Audit found ${flags.length} unresolved flag(s) — review the Audit tab before publishing.`,
-        );
-      }
-
-      const patch = {
-        status,
-        stage: 'finalize',
-        progress: 100,
-        final_text: finalText,
-        result_words: wordCount(finalText),
-        unresolved_flags: flags,
-        notes: notesLines.length ? appendNote(job.notes, notesLines.join('\n')) : job.notes,
-      };
-
-      return res.json({ stage, status, unresolved_flags: flags, counts, patch });
+      return res.json({ stage, status, unresolved_flags: flags, counts: summarizeAudit(audit), patch: {
+        audit, status, stage, progress: 100, final_text: job.rewritten_text, result_words: wordCount(job.rewritten_text), unresolved_flags: flags,
+        notes: appendNote(job.notes, flags.length ? `${flags.length} unresolved finding(s) require your review.` : 'Automated checks found no differences. Review the result before use; an AI audit is not a guarantee of factual accuracy.'),
+      } });
     }
-
-    return res.status(400).json({ error: `Unknown stage: ${stage}` });
   } catch (error) {
-    console.error('run-stage error:', { stage, message: error.message });
-    const message = error.message || 'The pipeline stage failed.';
-    return res.status(error.status || 500).json({ error: message });
+    // Avoid logging source text, model outputs, upstream response bodies, or credentials.
+    if (error instanceof LLMError) return res.status(error.status || 502).json({ error: error.message, code: error.code });
+    return res.status(500).json({ error: 'The rewrite stage failed. Please retry.', code: 'internal_error' });
   }
 }

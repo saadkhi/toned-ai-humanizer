@@ -26,6 +26,7 @@ export default function Settings() {
   const [saving, setSaving] = useState(false);
   const [wiping, setWiping] = useState(false);
   const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
 
   const load = async () => {
     setLoading(true);
@@ -47,12 +48,13 @@ export default function Settings() {
   };
 
   useEffect(() => {
-    load().catch(() => setLoading(false));
+    load().catch((loadError) => { setError(loadError.message); setLoading(false); });
   }, []);
 
   const save = async () => {
     setSaving(true);
     setMessage('');
+    setError('');
     try {
       if (settingId) {
         await jobStore.UserSetting.update(settingId, { retention_days: retention });
@@ -62,6 +64,8 @@ export default function Settings() {
       }
       setSavedRetention(retention);
       setMessage('Saved. New rewrites follow this window.');
+    } catch (saveError) {
+      setError(saveError.message || 'Settings could not be saved.');
     } finally {
       setSaving(false);
     }
@@ -69,10 +73,14 @@ export default function Settings() {
 
   const wipe = async () => {
     setWiping(true);
+    setMessage('');
+    setError('');
     try {
       await jobStore.RewriteJob.deleteMany({ created_by_id: 'local' });
       setMessage('Every rewrite, tracked change and audit report has been deleted.');
       await load();
+    } catch (wipeError) {
+      setError(wipeError.message || 'Your saved rewrites could not be deleted.');
     } finally {
       setWiping(false);
     }
@@ -84,10 +92,11 @@ export default function Settings() {
         <p className="eyebrow">Data &amp; settings</p>
         <h1 className="mt-3 text-3xl sm:text-4xl">Your text, your window.</h1>
         <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-          Nothing you paste is used for training, and nothing is kept longer than the window you pick
-          here.
+          Choose how long this browser keeps your rewrites. Text sent for rewriting is processed by the configured AI provider under its own policies.
         </p>
       </header>
+
+      {error ? <div role="alert" className="rounded-2xl border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">{error}</div> : null}
 
       {message ? (
         <div className="rounded-2xl border border-success/35 bg-success/10 p-4 text-sm text-success">
@@ -99,7 +108,7 @@ export default function Settings() {
         <div className="rounded-2xl border border-border/80 bg-card p-6">
           <p className="eyebrow">Retention</p>
           <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-            Applies to new rewrites. Expired ones are deleted automatically when you open your history.
+            Applies to new rewrites. Expired ones are deleted automatically when you use the app.
           </p>
           <RadioGroup
             value={String(retention)}
@@ -143,8 +152,7 @@ export default function Settings() {
               </div>
             </dl>
             <p className="mt-4 text-xs leading-relaxed text-muted-foreground">
-              All data is stored locally in your browser. Files you open are read locally and never
-              uploaded.
+              History is stored in this browser. File contents are read locally, then sent to an AI provider when you run a rewrite.
             </p>
           </div>
 

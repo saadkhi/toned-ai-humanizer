@@ -41,7 +41,7 @@ export default function History() {
         <h1 className="mt-3 text-3xl sm:text-4xl">Everything you have rewritten.</h1>
         <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
           Each entry keeps the original, the rewrite and the full audit report. Expired rewrites are
-          deleted automatically the next time you open this page.
+          deleted automatically when you use the app.
         </p>
       </header>
 

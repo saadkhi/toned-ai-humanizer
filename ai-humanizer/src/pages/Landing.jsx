@@ -9,8 +9,8 @@ import PrivacyBand from '@/components/landing/PrivacyBand';
 export default function Landing() {
   return (
     <div className="min-h-screen bg-background">
-      <SiteHeader isAuthed={false} />
-      <Hero isAuthed={false} />
+      <SiteHeader />
+      <Hero />
       <DemoCompare />
       <StageList />
       <StyleGrid />

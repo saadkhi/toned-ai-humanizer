@@ -1,113 +1,99 @@
-/**
- * localStorage-backed job store.
- * Replaces base44.entities.RewriteJob and base44.entities.UserSetting.
- */
+/** Browser-local history. No-retention jobs stay in memory and never touch disk. */
+const JOB_KEY = 'humanizer_jobs';
+const SETTING_KEY = 'humanizer_settings';
+const temporaryJobs = new Map();
 
 function readAll(key) {
+  let value;
   try {
-    return JSON.parse(localStorage.getItem(key) || '[]');
+    value = JSON.parse(localStorage.getItem(key) || '[]');
   } catch {
-    return [];
+    throw new Error('Saved data could not be read. Check that browser storage is available.');
   }
+  if (!Array.isArray(value)) throw new Error('Saved data is damaged. Clear this site’s browser data to reset it.');
+  return value;
 }
 
 function writeAll(key, items) {
-  localStorage.setItem(key, JSON.stringify(items));
+  try {
+    localStorage.setItem(key, JSON.stringify(items));
+  } catch {
+    throw new Error('Your browser could not save this rewrite. Free some site storage, or choose “Do not save to history” in settings.');
+  }
 }
 
-function makeId() {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+function savedJobs() {
+  const all = readAll(JOB_KEY);
+  const current = all.filter((job) => !job.expires_at || Date.parse(job.expires_at) > Date.now());
+  if (current.length !== all.length) writeAll(JOB_KEY, current);
+  return current;
 }
 
-function now() {
-  return new Date().toISOString();
-}
-
-// ─── RewriteJob ───────────────────────────────────────────────────────────────
-
-const JOB_KEY = 'humanizer_jobs';
+const makeId = () => crypto.randomUUID();
+const now = () => new Date().toISOString();
 
 const RewriteJob = {
-  create(data) {
-    const jobs = readAll(JOB_KEY);
+  async create(data) {
     const record = { ...data, id: makeId(), created_date: now() };
-    jobs.unshift(record);
-    writeAll(JOB_KEY, jobs);
-    return Promise.resolve(record);
+    if (data.retention_days === 0) temporaryJobs.set(record.id, record);
+    else writeAll(JOB_KEY, [record, ...savedJobs()]);
+    return record;
   },
-
-  get(id) {
-    const jobs = readAll(JOB_KEY);
-    const found = jobs.find((j) => j.id === id);
-    if (!found) return Promise.reject(new Error('Job not found'));
-    return Promise.resolve(found);
+  async get(id) {
+    const found = temporaryJobs.get(id) || savedJobs().find((job) => job.id === id);
+    if (!found) throw new Error('That rewrite is no longer available. It may have expired or been deleted.');
+    return found;
   },
-
-  update(id, patch) {
-    const jobs = readAll(JOB_KEY);
-    const index = jobs.findIndex((j) => j.id === id);
-    if (index === -1) return Promise.reject(new Error('Job not found'));
-    jobs[index] = { ...jobs[index], ...patch };
-    writeAll(JOB_KEY, jobs);
-    return Promise.resolve(jobs[index]);
-  },
-
-  delete(id) {
-    const jobs = readAll(JOB_KEY).filter((j) => j.id !== id);
-    writeAll(JOB_KEY, jobs);
-    return Promise.resolve();
-  },
-
-  deleteMany(filter) {
-    let jobs = readAll(JOB_KEY);
-    if (filter?.expires_at?.$lt) {
-      const cutoff = filter.expires_at.$lt;
-      jobs = jobs.filter((j) => !j.expires_at || j.expires_at >= cutoff);
-    } else if (filter?.created_by_id !== undefined) {
-      // Wipe all (single-user app, created_by_id is ignored)
-      jobs = [];
+  async update(id, patch) {
+    if (temporaryJobs.has(id)) {
+      const record = { ...temporaryJobs.get(id), ...patch, id };
+      temporaryJobs.set(id, record);
+      return record;
     }
+    const jobs = savedJobs();
+    const index = jobs.findIndex((job) => job.id === id);
+    if (index === -1) throw new Error('That rewrite is no longer available.');
+    jobs[index] = { ...jobs[index], ...patch, id };
     writeAll(JOB_KEY, jobs);
-    return Promise.resolve();
+    return jobs[index];
   },
-
-  /** list(sortField, limit) — sortField prefixed with '-' means descending */
-  list(sortField = '-created_date', limit = 100) {
-    let jobs = readAll(JOB_KEY);
+  async delete(id) {
+    if (temporaryJobs.delete(id)) return;
+    writeAll(JOB_KEY, savedJobs().filter((job) => job.id !== id));
+  },
+  async deleteMany(filter) {
+    if (filter?.created_by_id !== undefined) {
+      temporaryJobs.clear();
+      writeAll(JOB_KEY, []);
+      return;
+    }
+    if (filter?.expires_at?.$lt) {
+      writeAll(JOB_KEY, savedJobs().filter((job) => !job.expires_at || job.expires_at >= filter.expires_at.$lt));
+    }
+  },
+  async list(sortField = '-created_date', limit = 100) {
     const desc = String(sortField).startsWith('-');
     const field = desc ? sortField.slice(1) : sortField;
-    jobs.sort((a, b) => {
-      const av = a[field] || '';
-      const bv = b[field] || '';
-      return desc ? (bv > av ? 1 : -1) : av > bv ? 1 : -1;
-    });
-    return Promise.resolve(jobs.slice(0, limit));
+    return savedJobs().sort((a, b) => {
+      const comparison = String(a[field] || '').localeCompare(String(b[field] || ''));
+      return desc ? -comparison : comparison;
+    }).slice(0, limit);
   },
 };
 
-// ─── UserSetting ──────────────────────────────────────────────────────────────
-
-const SETTING_KEY = 'humanizer_settings';
-
 const UserSetting = {
-  list(_sort, _limit) {
-    const settings = readAll(SETTING_KEY);
-    return Promise.resolve(settings.slice(0, 1));
-  },
-
-  create(data) {
+  async list() { return readAll(SETTING_KEY).slice(0, 1); },
+  async create(data) {
     const record = { ...data, id: makeId(), created_date: now() };
     writeAll(SETTING_KEY, [record]);
-    return Promise.resolve(record);
+    return record;
   },
-
-  update(id, patch) {
-    const settings = readAll(SETTING_KEY);
-    const index = settings.findIndex((s) => s.id === id);
-    if (index === -1) return Promise.reject(new Error('Setting not found'));
-    settings[index] = { ...settings[index], ...patch };
-    writeAll(SETTING_KEY, settings);
-    return Promise.resolve(settings[index]);
+  async update(id, patch) {
+    const record = readAll(SETTING_KEY).find((setting) => setting.id === id);
+    if (!record) throw new Error('Settings could not be found. Reload this page and try again.');
+    const updated = { ...record, ...patch, id };
+    writeAll(SETTING_KEY, [updated]);
+    return updated;
   },
 };
 

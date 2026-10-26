@@ -9,13 +9,13 @@ import { Loader2, Wand2 } from 'lucide-react';
 function RetentionLine({ retentionDays }) {
   const copy =
     retentionDays === 0
-      ? 'Not saved: this rewrite is deleted as soon as you close the result.'
-      : `Saved to your history for ${retentionDays} days, then deleted automatically.`;
+      ? 'Not saved: this rewrite is kept only while this page is open.'
+      : `Saved to your history for ${retentionDays} days. Expired rewrites are removed when you use the app.`;
   return <p className="text-xs leading-relaxed text-muted-foreground">{copy}</p>;
 }
 
-export default function ControlPane({ value, onChange, onRun, running, retentionDays }) {
-  const canRun = !running && value.text.trim().length > 0 && value.text.length <= 20000;
+export default function ControlPane({ value, onChange, onRun, running, retentionDays, available = true }) {
+  const canRun = available && !running && value.text.trim().length > 0 && value.text.length <= 20000;
 
   return (
     <section className="space-y-6 rounded-2xl border border-border/80 bg-card p-5 sm:p-6">
@@ -33,11 +33,12 @@ export default function ControlPane({ value, onChange, onRun, running, retention
         <Input
           id="purpose"
           value={value.purpose}
+          maxLength={1000}
           onChange={(event) => onChange({ purpose: event.target.value })}
           placeholder="A methods section for a journal"
         />
         <p className="text-xs leading-relaxed text-muted-foreground">
-          Used to check the request is legitimate, and to judge register. Never shared.
+          Helps choose the right register. Sent to the AI provider with your document.
         </p>
       </div>
 

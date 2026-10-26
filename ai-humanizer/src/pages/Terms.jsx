@@ -11,11 +11,11 @@ const SECTIONS = [
   },
   {
     title: 'Your content',
-    body: 'You keep all rights in the text you submit. You confirm you have the right to submit it. Your text is used to produce your rewrite and for nothing else: it is not used to train models and is not shared with other users.',
+    body: 'You keep all rights in the text you submit. You confirm you have the right to submit it. Your text is sent to the AI providers configured by the service operator to produce and check your rewrite. Their policies govern their handling of that text. See Privacy for how local history and external processing work.',
   },
   {
     title: 'Accuracy',
-    body: 'The audit catches drift in claims, numbers, names, citations, quotations and certainty markers, and surfaces anything it cannot confirm. It is an aid to review, not a guarantee. You remain the author and the person responsible for the final text.',
+    body: 'The audit attempts to identify changes in claims, numbers, names, citations, quotations and certainty markers. Automated checks can miss errors or flag correct text. It is an aid to review, not a guarantee. You remain the author and the person responsible for the final text.',
   },
   {
     title: 'Availability and liability',
@@ -28,10 +28,7 @@ export default function Terms() {
     <div className="min-h-screen bg-background">
       <SiteHeader />
       <main className="mx-auto w-full max-w-3xl px-4 py-16 sm:px-6">
-        <div className="rounded-xl border border-warning/45 bg-warning/10 p-4 text-sm text-warning">
-          Placeholder — legal review required before publishing.
-        </div>
-        <p className="eyebrow mt-10">Terms of service</p>
+        <p className="eyebrow">Using Humanizer</p>
         <h1 className="mt-4 text-4xl">Terms</h1>
         <div className="mt-10 space-y-8">
           {SECTIONS.map((section) => (

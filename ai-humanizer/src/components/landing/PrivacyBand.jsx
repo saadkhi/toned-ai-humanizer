@@ -1,15 +1,15 @@
 const POINTS = [
   {
     title: 'Retention you choose',
-    body: 'Keep rewrites for 7, 30 or 90 days, or delete them the moment you close the result. Expired jobs are removed automatically.',
+    body: 'Keep rewrites for 7, 30 or 90 days, or keep a rewrite only while the page is open. Expired saved jobs are removed when you use the app.',
   },
   {
-    title: 'Never used for training',
-    body: 'Your text is processed to produce your rewrite. It is not stored for model training and is never reused anywhere else.',
+    title: 'Clear about AI processing',
+    body: 'Your text is sent to the configured AI provider for rewriting and checks. Its data policies apply; share only content you are permitted to send.',
   },
   {
     title: 'One-click deletion',
-    body: 'Delete everything from the settings page and it is gone from the database immediately — not queued for a later purge.',
+    body: 'Delete everything from the settings page and it is removed from this browser immediately. Copies retained by providers follow their own policies.',
   },
   {
     title: 'No detector theatre',

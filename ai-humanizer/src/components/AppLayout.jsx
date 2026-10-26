@@ -45,7 +45,8 @@ export default function AppLayout() {
             variant="ghost"
             size="icon"
             className="md:hidden"
-            aria-label="Menu"
+            aria-label="Toggle menu"
+            aria-expanded={open}
             onClick={() => setOpen((v) => !v)}
           >
             {open ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
@@ -78,7 +79,7 @@ export default function AppLayout() {
         <div className="mx-auto flex w-full max-w-7xl flex-col gap-2 px-4 py-6 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between sm:px-6 lg:px-8">
           <p className="flex items-center gap-2">
             <Check className="h-3.5 w-3.5" />
-            Facts, numbers, names and citations are audited on every job. Nothing is used for training.
+            AI-assisted checks support your review. History stays in this browser.
           </p>
         </div>
       </footer>

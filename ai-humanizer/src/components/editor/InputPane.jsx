@@ -41,7 +41,7 @@ export default function InputPane({ value, onChange, onFile, onError, maxChars }
       </div>
       {over ? (
         <p className="mt-2 text-xs text-destructive">
-          Over the limit. Split the document, or raise MAX_INPUT_CHARS in the app settings.
+          Over the limit. Split the document into shorter sections before rewriting.
         </p>
       ) : null}
     </section>

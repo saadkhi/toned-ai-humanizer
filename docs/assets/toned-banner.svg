@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="440" viewBox="0 0 1440 440" role="img" aria-labelledby="title description">
+  <title id="title">Toned AI Humanizer — your voice, with more clarity</title>
+  <desc id="description">An evergreen and cream editorial banner with a marked-up document illustration. Rewrite thoughtfully. Review every change.</desc>
+  <defs>
+    <linearGradient id="forest" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#183f35"/><stop offset="1" stop-color="#102b25"/></linearGradient>
+    <pattern id="grid" width="44" height="44" patternUnits="userSpaceOnUse"><path d="M 44 0 L 0 0 0 44" fill="none" stroke="#f5f1e8" stroke-opacity=".045"/></pattern>
+  </defs>
+  <rect width="1440" height="440" rx="24" fill="url(#forest)"/>
+  <rect width="1440" height="440" rx="24" fill="url(#grid)"/>
+  <circle cx="1390" cy="16" r="310" fill="#f5f1e8" opacity=".025"/>
+  <circle cx="1390" cy="16" r="236" fill="none" stroke="#cdbb92" stroke-opacity=".15"/>
+  <g transform="translate(72 62)">
+    <path d="M0 1h30M15 1v30" fill="none" stroke="#d8c5a2" stroke-width="3" stroke-linecap="round"/>
+    <text x="47" y="26" fill="#f7f3ea" font-family="Georgia, 'Times New Roman', serif" font-size="36" letter-spacing="-1">toned</text>
+    <text x="0" y="94" fill="#d8c5a2" font-family="Arial, Helvetica, sans-serif" font-size="12" letter-spacing="3">A VOICE-AND-RIGOR EDITOR</text>
+    <text x="-2" y="161" fill="#f7f3ea" font-family="Georgia, 'Times New Roman', serif" font-size="58" letter-spacing="-1.6">Your voice,</text>
+    <text x="-2" y="226" fill="#f7f3ea" font-family="Georgia, 'Times New Roman', serif" font-size="58" letter-spacing="-1.6">with more clarity.</text>
+    <text x="0" y="278" fill="#c6d3c8" font-family="Arial, Helvetica, sans-serif" font-size="18">Rewrite thoughtfully. Review every change.</text>
+    <path d="M0 312h56" stroke="#c78d61" stroke-width="2"/>
+    <text x="72" y="317" fill="#c6d3c8" font-family="Arial, Helvetica, sans-serif" font-size="12" letter-spacing="1.5">THE FINAL SAY STAYS WITH YOU</text>
+  </g>
+  <g transform="translate(1000 68) rotate(5 150 150)">
+    <rect x="-12" y="12" width="284" height="306" rx="14" fill="#0a1d18" opacity=".35"/>
+    <rect width="284" height="306" rx="14" fill="#f7f3ea"/>
+    <rect x="29" y="30" width="27" height="4" rx="2" fill="#b4774d"/>
+    <text x="29" y="64" fill="#244b3e" font-family="Georgia, 'Times New Roman', serif" font-size="21">A clearer draft.</text>
+    <path d="M29 94h226M29 108h189" stroke="#d1ccc2" stroke-width="6" stroke-linecap="round"/>
+    <rect x="25" y="126" width="150" height="21" rx="4" fill="#ecd8d0"/>
+    <path d="M33 137h133" stroke="#a36752" stroke-width="3" stroke-linecap="round"/>
+    <path d="M29 165h214M29 179h177" stroke="#d1ccc2" stroke-width="6" stroke-linecap="round"/>
+    <rect x="25" y="198" width="194" height="23" rx="4" fill="#dce8dc"/>
+    <path d="M33 211h177" stroke="#5a7e60" stroke-width="3" stroke-linecap="round"/>
+    <path d="M29 243h220M29 257h146" stroke="#d1ccc2" stroke-width="6" stroke-linecap="round"/>
+  </g>
+</svg>
