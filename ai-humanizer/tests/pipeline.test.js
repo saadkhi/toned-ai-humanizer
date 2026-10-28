@@ -14,7 +14,7 @@ async function call(body, method = 'POST') {
 }
 function configure(t, results = []) {
   const originalFetch = globalThis.fetch;
-  const names = Object.keys(process.env).filter((name) => /^(GOOGLE|OPENROUTER|SAMBANOVA|CLOUDFLARE)_API_KEY|^UPSTASH_REDIS_|^VERCEL$/.test(name));
+  const names = Object.keys(process.env).filter((name) => /^(GOOGLE|OPENROUTER|SAMBANOVA|CLOUDFLARE)_API_KEY|^UPSTASH_REDIS_|^VERCEL$|^(DATABASE_URL|NEON_DATABASE_URL|RATE_LIMIT_STORE)$/.test(name));
   const previous = Object.fromEntries([...names, 'NODE_ENV', 'VERCEL_ENV', 'GOOGLE_API_KEY_1', 'OPENROUTER_API_KEY_1', 'AI_PROVIDER_MODE'].map((name) => [name, process.env[name]]));
   for (const name of names) delete process.env[name];
   process.env.GOOGLE_API_KEY_1 = 'synthetic-unit-test-key';

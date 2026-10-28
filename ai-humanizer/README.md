@@ -25,7 +25,7 @@ In a cloud environment that provides `HTTPS_PROXY`/`HTTP_PROXY`, start Node 24 w
 
 The default **free-only** mode uses OpenRouter's `openrouter/free` route for both fast and quality stages. Set `OPENROUTER_API_KEY_1` on the server. Optional `_2`/`_3` keys rotate as needed. `OPENROUTER_FREE_MODEL` may select a model ending in `:free`; a paid model ID is rejected in this mode. Google, SambaNova, Cloudflare, and paid OpenRouter model overrides are excluded from fallback while free-only mode is active.
 
-The model catalog reported zero prompt and completion pricing for `openrouter/free` during verification. Availability and provider free-tier limits still apply. Hosting and the production Redis service have separate plans and limits. Free-only routing does not promise unlimited use.
+The model catalog reported zero prompt and completion pricing for `openrouter/free` during verification. Availability and provider free-tier limits still apply. Hosting and production request-limit storage have separate plans and limits. Free-only routing does not promise unlimited use.
 
 To explicitly enable potentially paid providers/models, set `AI_PROVIDER_MODE=configured` and configure at least one of these **server** credentials:
 
@@ -68,12 +68,77 @@ Deploy the `ai-humanizer` directory as the Vercel project root. `vercel.json` co
 Before allowing public traffic:
 
 1. Keep `AI_PROVIDER_MODE=free` with a valid OpenRouter key for free-only routing, or explicitly opt in to configured mode with a valid provider credential and any model overrides in Vercel server environment settings.
-2. Create a dedicated Upstash Redis database and set `UPSTASH_REDIS_REST_URL` (HTTPS REST URL) and `UPSTASH_REDIS_REST_TOKEN`. Allow outbound requests to that exact database hostname. The token needs permission to execute EVAL. These values remain server-only.
+2. Configure **one** shared request-limit store: [Neon Postgres](#neon-postgres-setup) or [Upstash Redis](#upstash-redis-setup). Both offer Free plans with quotas. Use `RATE_LIMIT_STORE=neon` or `RATE_LIMIT_STORE=upstash` to make the choice explicit. Keep connection credentials server-only and allow outbound requests to the actual database hostname.
 3. Review `RATE_LIMIT_REQUESTS` (default 60 stage calls per client per 600 seconds) and `DAILY_STAGE_LIMIT` (default 1,000 stage calls globally per UTC day). These count requests, including retries, not documents or currency. A normal document uses multiple calls. Apply provider-side billing limits and deployment firewall/bot protection appropriate to your traffic.
-4. Run checks below. Validate a representative rewrite with the actual model/key and review its audit. Test deployment routes and headers. A green health response alone does not validate a key, Redis connectivity, or output quality.
+4. Run checks below. Validate a representative rewrite with the actual model/key and review its audit. Test deployment routes and headers. A green health response alone does not validate a key, database connectivity, installed Neon schema, or output quality.
 5. Deploy through your normal release process. This setup does not publish or deploy the app.
 
-Production billable endpoints fail closed if durable rate limiting is unconfigured or unavailable. Local development uses an in-memory limiter. Redis stores hashed client identifiers and counters, not source documents. The API rejects cross-origin browser calls, oversized requests, and malformed stage state. Rate limits cap abuse but are not user authentication; the application currently has no accounts or paid subscriptions. Use deployment access protection for private releases.
+Production billable endpoints fail closed if durable rate limiting is unconfigured or unavailable. Local development without store settings uses an in-memory limiter. Neon and Upstash store hashed client identifiers and counters, not source documents. Browser history does not move to Neon. The API rejects cross-origin browser calls, oversized requests, and malformed stage state. Rate limits cap abuse but are not user authentication; the application currently has no accounts or paid subscriptions. Use deployment access protection for private releases.
+
+### Neon Postgres setup
+
+Neon can provide the shared request-limit store without an Upstash account. Its Free plan has storage/compute quotas and can suspend idle compute; waking a database may add latency. Check [Neon's current plans](https://neon.com/pricing) for their limits.
+
+1. Open [Neon Console](https://console.neon.tech/), create a project on the **Free** plan, and select the database and branch you will use for production.
+2. Open that database's **SQL Editor** and run the complete [db/neon-rate-limits.sql](db/neon-rate-limits.sql) migration once. Use the same database/branch and role as the connection string. The migration creates the counters and atomic limiter function and can be rerun safely.
+3. Open **Connect** and copy the PostgreSQL connection string. Keep its password private. The URL must use the project's `*.neon.tech` hostname and `sslmode=require` or `sslmode=verify-full`; pooled Neon connection strings are supported. An optional `channel_binding=require` or `prefer` parameter is accepted; other connection query parameters are rejected.
+4. In **Vercel → Project → Settings → Environment Variables**, add these values for **Production**:
+
+| Variable | Value |
+| --- | --- |
+| `RATE_LIMIT_STORE` | `neon` |
+| `DATABASE_URL` | The full PostgreSQL connection string copied from Neon |
+| `AI_PROVIDER_MODE` | `free` to keep free-only model routing |
+
+`NEON_DATABASE_URL` is an alternative to `DATABASE_URL`; use one connection variable consistently. A Neon API key, dashboard URL, or database name alone is not a connection string. The Neon connection is used for counters only, so it does not create accounts or synchronize document history.
+
+Add Preview scope too if preview deployments should rewrite. Save the variables, then choose **Deployments → latest production deployment → Redeploy**. Setting `RATE_LIMIT_STORE=neon` explicitly selects Neon even if old Upstash variables remain. Upstash credentials are not required for this option.
+
+After deploying, confirm `/api/health` reports `configured: true` and `protectionConfigured: true`, then run a real rewrite. Health checks configuration presence/format only: it does not query Neon, check the migration, or verify the role's permissions. A missing migration, incorrect password, inaccessible database, or exhausted Free-plan quota will keep stage requests unavailable rather than bypassing limits.
+
+The server uses Neon's HTTPS driver, with a 15-second request deadline to allow a suspended Free compute to wake. In a cloud environment with restricted networking, allow the SDK's regional `api.<region>.<cloud>.neon.tech` destination for your database; allowing only the PostgreSQL endpoint hostname may be insufficient. Preserve TLS verification.
+
+#### Neon CLI workflow
+
+The included `neon.ts` declares a Postgres-only policy and leaves branch lifetime and compute settings unchanged. Link this app directory to your own project with `neon init`, then run `neon deploy`. If a global CLI install is unavailable, use `npx neon@latest` for those commands. The CLI writes its project link to ignored `.neon` and pulls the pooled `DATABASE_URL` and direct `DATABASE_URL_UNPOOLED` into an ignored local environment file. Keep `RATE_LIMIT_STORE=neon` and `AI_PROVIDER_MODE=free` in server settings.
+
+The CLI needs an authenticated Neon session or a securely injected `NEON_API_KEY`. A database connection string authorizes SQL, while deployment also needs project-management access. On a remote runner, a scoped API key can be easier than browser OAuth. Never put either credential in source control or chat. Restricted network environments must allow `api.neon.tech` for management, `oauth2.neon.tech` for browser sign-in, and the actual database HTTP endpoint for application requests. Some database endpoints include a routing label such as `c-6`; preserve that label in the SDK destination.
+
+Apply the tracked schema through a direct connection after deployment:
+
+```bash
+npx neon@latest psql production -- -v ON_ERROR_STOP=1 -f db/neon-rate-limits.sql
+npm run db:check
+npm run db:check -- --exercise-guard
+```
+
+The final command consumes one real request allowance. The check reads `.env.local` and `.env` while preserving injected environment values, verifies connectivity/schema/permissions, and prints sanitized status records. A nonzero exit means verification did not pass; missing configuration is never reported as a successful connection. Start `npm run dev` and exercise a real rewrite afterward. `neon deploy` provisions backend settings; Vercel remains the frontend/API host and requires its own server environment configuration and redeployment.
+
+### Upstash Redis setup
+
+Open [Upstash Console](https://console.upstash.com/), create a dedicated Redis database, and choose the **Free** plan. Open its **REST API** section and copy the REST URL and standard REST token. Free-plan quotas apply; [check the current limits](https://upstash.com/pricing/redis).
+
+In **Vercel → Project → Settings → Environment Variables**, set these variables for **Production**:
+
+| Variable | Required value |
+| --- | --- |
+| `RATE_LIMIT_STORE` | `upstash` |
+| `UPSTASH_REDIS_REST_URL` | The database's HTTPS REST URL, such as `https://<database>.upstash.io`. Use the REST URL, not a `redis://` connection string; do not add a path or query. |
+| `UPSTASH_REDIS_REST_TOKEN` | The database's REST token with EVAL/write permission; a read-only token cannot enforce counters. |
+
+Save, then redeploy the production deployment. Neon credentials and its SQL migration are not required for this option.
+
+With `RATE_LIMIT_STORE=auto` (the default), any supplied Upstash REST variable selects Upstash; otherwise a supplied Neon URL selects Neon. A partial or invalid selected store fails closed. Explicit store selection avoids ambiguity when several integrations add environment variables. Local development can omit all store credentials.
+
+### Rewriting is unavailable after deployment
+
+Inspect the deployed `/api/health` response. When it reports `providerConfigured: true` and `protectionConfigured: false`, the model provider has configuration but production request limiting does not. Waiting or adding another model key will not resolve this setup issue.
+
+Follow either the [Neon](#neon-postgres-setup) or [Upstash](#upstash-redis-setup) setup above. Enter database credentials securely in Vercel; they are separate from Codex cloud environment bindings. Add Preview scope too if preview deployments should rewrite. **Redeploy after saving:** changing variables does not update an already-built deployment.
+
+In Vercel, open **Deployments**, select the latest production deployment, and choose **Redeploy** after saving the selected store's variables. Do not paste database passwords or tokens into the editor, source files, chat, or a variable prefixed with `VITE_`.
+
+After redeployment, health should return HTTP200 with `configured`, `providerConfigured`, and `protectionConfigured` all `true`. Then run a real rewrite: health checks presence/format only, so incorrect credentials, missing Neon schema, an inaccessible store, or an unavailable model can still cause a stage error. Keep free-only routing enabled; its production request protection is still required.
 
 ## Data and privacy
 

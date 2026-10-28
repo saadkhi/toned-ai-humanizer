@@ -17,6 +17,7 @@ export default function health(req, res) {
     configured,
     providerConfigured: provider.configured,
     protectionConfigured,
+    protectionStore: security.store,
     providers: provider.providers,
   });
 }

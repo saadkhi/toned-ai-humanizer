@@ -73,3 +73,32 @@ test('health is unavailable for a paid free-model override with no paid-provider
   assert.equal(res.body.providerConfigured, false);
   assert.deepEqual(res.body.providers, []);
 });
+
+test('Neon production readiness reports the store without contacting or exposing the database', t => {
+  setup(t, {
+    NODE_ENV: 'production', AI_PROVIDER_MODE: 'free', OPENROUTER_API_KEY: 'synthetic-health-model-key',
+    RATE_LIMIT_STORE: 'neon', DATABASE_URL: 'postgresql://synthetic_user:synthetic_health_password@ep-health.us-east-2.aws.neon.tech/neondb?sslmode=require',
+    UPSTASH_REDIS_REST_TOKEN: 'old-unused-binding',
+  });
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = () => assert.fail('Health must not perform a database or provider request');
+  t.after(() => { globalThis.fetch = previousFetch; });
+  const res = call();
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.protectionConfigured, true);
+  assert.equal(res.body.protectionStore, 'neon');
+  assert.deepEqual(res.body.providers, ['openrouter']);
+  assert.doesNotMatch(JSON.stringify(res.body), /synthetic_|postgresql:|neon\.tech|unused-binding/);
+});
+
+test('invalid Neon production bindings cannot report protection ready', t => {
+  setup(t, {
+    NODE_ENV: 'production', GOOGLE_API_KEY: 'synthetic-health-model-key', RATE_LIMIT_STORE: 'neon',
+    DATABASE_URL: 'postgresql://synthetic_user:synthetic_password@evil.example/neondb?sslmode=require',
+  });
+  const res = call();
+  assert.equal(res.statusCode, 503);
+  assert.equal(res.body.providerConfigured, true);
+  assert.equal(res.body.protectionConfigured, false);
+  assert.equal(res.body.protectionStore, 'neon');
+});

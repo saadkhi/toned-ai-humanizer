@@ -61,7 +61,11 @@ export default function Editor() {
       const health = await requestJson('/api/health', {
         timeoutMs: 10000, signal: controller.signal, allowUnavailable: true,
       });
-      if (!controller.signal.aborted) setService(health.configured === true ? 'ready' : 'unavailable');
+      if (!controller.signal.aborted) {
+        setService(health.configured === true ? 'ready'
+          : health.providerConfigured === false || health.protectionConfigured === false ? 'setup_required'
+            : 'unavailable');
+      }
     } catch {
       if (!controller.signal.aborted) setService('unavailable');
     }
@@ -296,9 +300,17 @@ export default function Editor() {
           <div>
             <p className="flex items-center gap-2 font-medium">
               {service === 'checking' ? <Loader2 className="h-4 w-4 animate-spin" /> : <AlertTriangle className="h-4 w-4 text-warning" />}
-              {service === 'checking' ? 'Checking rewriting availability…' : 'Rewriting is temporarily unavailable'}
+              {service === 'checking' ? 'Checking rewriting availability…'
+                : service === 'setup_required' ? 'Rewriting is not enabled on this site yet'
+                  : 'Rewriting is temporarily unavailable'}
             </p>
-            {service !== 'checking' ? <p className="mt-1 text-muted-foreground">You can prepare your draft and browse saved rewrites. Try again in a moment.</p> : null}
+            {service !== 'checking' ? (
+              <p className="mt-1 text-muted-foreground">
+                {service === 'setup_required'
+                  ? 'Site setup is incomplete. You can prepare your draft and browse saved rewrites. Please contact the site owner.'
+                  : 'You can prepare your draft and browse saved rewrites. Try again in a moment.'}
+              </p>
+            ) : null}
           </div>
           <Button variant="outline" size="sm" onClick={checkService} disabled={service === 'checking'}>Check again</Button>
         </div>

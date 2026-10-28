@@ -1,6 +1,6 @@
 # Release verification · 28 October 2026
 
-This report records checks against the repository in the cloud development environment. Public-site navigation to `https://ai-humanizer-pearl.vercel.app/` was blocked by the environment proxy, so these results do not establish the state of the deployed application.
+This report records checks against the repository in the cloud development environment. The initial public-site inspection was blocked by the environment proxy. A later live check reached the deployment and confirmed a configuration blocker; see the follow-up below.
 
 ## Changes verified
 
@@ -28,6 +28,46 @@ The real-provider sample was a short two-paragraph document containing `42`, `20
 
 ## Deployment checks still required
 
-The cloud instance did not have production Redis credentials, and its environment settings are separate from Vercel. Before opening public traffic, verify Vercel's OpenRouter binding, free mode, dedicated Upstash URL/token, and shared rate limits; then redeploy the pushed commit and run a real rewrite on the public URL. Production generation intentionally fails closed without usable durable limiting.
+The cloud instance did not have production store credentials, and its environment settings are separate from Vercel. Before opening public traffic, verify Vercel's OpenRouter binding, free mode, selected Neon/Upstash configuration, and shared rate limits; then redeploy the pushed commit and run a real rewrite on the public URL. Production generation intentionally fails closed without usable durable limiting.
 
-The cloud network draft includes the public app and font domains. Saving the draft does not apply it to the running environment or publish it. Live-site inspection can resume after those network settings are applied. See the [deployment guide](../ai-humanizer/README.md#production-deployment).
+The cloud network draft includes the public app and font domains. Saving a draft does not apply it to the running environment or publish it. See the [deployment guide](../ai-humanizer/README.md#production-deployment).
+
+## Live deployment follow-up · 28 October 2026
+
+The public health endpoint returned HTTP 503:
+
+```json
+{"mode":"free","configured":false,"providerConfigured":true,"protectionConfigured":false,"providers":["openrouter"]}
+```
+
+A synthetic extraction request to the public `/api/run-stage` also returned HTTP 503 with `code: "rate_limit_unavailable"`. This confirms production request protection is missing or malformed in the deployment configuration. It does not indicate a missing model key or validate the configured OpenRouter credential.
+
+Chromium reproduced the deployed banner with the rewrite button disabled and no page errors. The cloud proxy's certificate was not trusted by Chromium directly, so unchanged live resources were forwarded through Node's TLS-verified environment proxy; no application or API responses were mocked.
+
+The editor previously described this permanent setup issue as temporarily unavailable and suggested waiting. It now distinguishes incomplete site setup from temporary connectivity failures. Regression tests cover both missing configuration flags, disabled generation without a stage request, and recovery after configuration changes while preserving the draft.
+
+After this fix, `npm run check` passed lint, all 128 unit tests, and the production build. The full Chromium suite passed all 29 tests with no skips.
+
+The deployment still needs a shared limiter configured in Vercel's Production environment, followed by redeployment. It can now use Neon or Upstash. This session has no Vercel settings access. See [the recovery steps](../ai-humanizer/README.md#rewriting-is-unavailable-after-deployment).
+
+## Neon alternative · 28 October 2026
+
+Neon Postgres is supported alongside Upstash. Set `RATE_LIMIT_STORE=neon`, supply a server-only `DATABASE_URL` (or `NEON_DATABASE_URL`), and run [the SQL migration](../ai-humanizer/db/neon-rate-limits.sql) once in the same database/branch and role. Neon stores hashed request counters only; document history stays in the browser. Both limits are checked and consumed within one PostgreSQL function call. Rejected requests do not consume allowance or create new empty client counters.
+
+Automated tests exercise the actual Neon SDK with mocked HTTPS responses, plus the migration and limiter function on PGlite's embedded PostgreSQL engine. An integration test forwards the real guard/SDK's parameterized query into that engine and parses its response through the SDK. They cover repeatable migration, limits, expiration cleanup, invalid inputs, failed-update rollback, error privacy, and queued capacity requests. PGlite serializes its submissions; this is not a multi-connection Neon load test.
+
+Validation after the Neon addition: lint, all 146 unit/integration tests, production build, and all 29 Chromium tests passed with no skips. The dependency audit reported zero vulnerabilities, and the browser build excludes the Neon server transport.
+
+No live Neon connection string was injected into this environment during those checks, so hosted Neon connectivity and the production schema remain unverified. Run the migration and configure Vercel using the [Neon setup guide](../ai-humanizer/README.md#neon-postgres-setup), redeploy, then test a public rewrite.
+
+## Neon CLI setup attempt · 28 October 2026
+
+- Global `npm i -g neon@latest` failed because the runner's home install directory is unwritable. The requested `npx neon@latest` fallback installed and ran CLI 8.13.1.
+- The default initializer's global plugin install hit the same home-directory limitation. A supported project-scoped retry installed the `neon` and `neon-postgres` agent skills and generated `neon.ts` with its dependencies.
+- The directory is linked locally to the requested project/production branch, with `.neon` ignored. The CLI explicitly reported `Written offline (--no-checks): nothing was verified.` The Postgres-only policy leaves branch lifetime and compute settings unchanged.
+- `neon deploy` and `neon login` failed with `Could not reach the Neon API`. Direct requests to management and OAuth endpoints received proxy CONNECT 403, including after a network escalation attempt. Required host additions and a secure `NEON_API_KEY` binding were saved in the cloud environment draft; the binding was still unfilled at the last check.
+- The app already reads the CLI's pooled `DATABASE_URL`. A local ignored environment file sets only `RATE_LIMIT_STORE=neon` and `AI_PROVIDER_MODE=free`; no connection credential was invented or copied into source.
+
+Validation completed: `npm run build` passed, `npm run check` passed lint, 146 tests, and build, the full Chromium suite passed 29 tests, and the dependency audit reported zero vulnerabilities. The app started; its root returned HTTP 200. Health returned HTTP 503 with `protectionStore: "neon"`, `providerConfigured: true`, and `protectionConfigured: false`. A synthetic stage request returned HTTP 503 `rate_limit_unavailable` without calling a model.
+
+The new `npm run db:check` command correctly exited 1 with `neonUrlPresent: false`; it did not claim a working database. Deployment, environment download, schema application, real Neon access, and a real Neon-backed rewrite remain blocked pending network access and CLI authentication. No end-to-end Neon success is claimed. See [the CLI workflow](../ai-humanizer/README.md#neon-cli-workflow).

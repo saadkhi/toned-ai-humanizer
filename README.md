@@ -128,7 +128,7 @@ npm run dev
 
 Use the address printed by Vite. The development server runs the interface and the real API handlers together. Restart it after changing environment variables.
 
-No account, database for document history, or separate backend process is needed for local development. Free-tier availability and rate limits apply. Potentially paid models require explicit configured-mode opt-in; hosting and Redis have their own plans and limits.
+No account, database for document history, or separate backend process is needed for local development. Free-tier availability and rate limits apply. Potentially paid models require explicit configured-mode opt-in; hosting and request-limit storage have their own plans and limits.
 
 ### Free-only by default
 
@@ -158,12 +158,12 @@ Import this repository into Vercel and set the **Root Directory** to **`ai-human
 Before opening the deployment to users:
 
 1. **Add `OPENROUTER_API_KEY_1`** in Vercel’s server environment settings and keep `AI_PROVIDER_MODE=free`, or explicitly choose configured mode and its provider credentials. Cloud development settings do not automatically configure a deployment.
-2. **Configure shared request limits** with `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` from a dedicated Upstash database. The token needs EVAL permissions. Production and preview deployments require this shared limiter.
+2. **Configure one shared request-limit store.** Use [Neon Postgres](ai-humanizer/README.md#neon-postgres-setup) with `RATE_LIMIT_STORE=neon` and `DATABASE_URL`, or [Upstash Redis](ai-humanizer/README.md#upstash-redis-setup) with its REST URL/token. Both offer Free plans with quotas. Neon needs the included SQL migration once. Production and preview deployments require a shared limiter; using Neon does not require Upstash.
 3. **Set a usage budget.** Defaults allow 60 stage requests per client per 10 minutes and 1,000 globally per UTC day. A document uses multiple stage requests. Review those limits and your provider’s billing controls for your expected traffic.
 4. **Run the checks**, then exercise a representative rewrite using your actual provider credentials and inspect its audit.
 5. **Verify the deployed experience**, including direct page routes, exports, missing-service messages, and rate-limit behavior.
 
-`/api/health` reports whether configuration is present. It does not validate a provider key, model availability, Redis connectivity, or writing quality. Production billable requests fail closed when the shared limiter is missing or unavailable.
+`/api/health` reports whether configuration is present. It does not validate a provider key, model availability, database connectivity, installed Neon schema, or writing quality. Production billable requests fail closed when the shared limiter is missing or unavailable. The limiter stores counters and hashed client identifiers; document history stays in your browser.
 
 **[Read the full deployment guide →](ai-humanizer/README.md#production-deployment)**
 
@@ -186,7 +186,7 @@ Toned supports editorial work. It does not promise detector scores, undetectabil
 | Model integration | Google, OpenRouter, SambaNova, Cloudflare Workers AI |
 | Contracts and checks | Zod schemas, source IDs, fingerprints, deterministic comparisons |
 | Document history | Browser `localStorage`; memory-only jobs when history is disabled |
-| Production request limits | Upstash Redis with atomic per-client and daily counters |
+| Production request limits | Neon Postgres or Upstash Redis with atomic per-client and daily counters |
 | Verification | ESLint, Node’s test runner, Playwright, GitHub Actions |
 
 ```text
@@ -198,6 +198,7 @@ Toned supports editorial work. It does not promise detector scores, undetectabil
     ├── src/                   Editor, review tools, history, and settings
     ├── api/                   Rewrite stages, providers, health, and request limits
     ├── scripts/               Local API adapter
+    ├── db/                    Neon request-limit schema migration
     ├── tests/                 Regression tests
     ├── e2e/                   Browser workflow tests
     └── README.md              Configuration and deployment reference

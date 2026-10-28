@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
+import { neonDatabaseUrl, neonLimit } from './_neon.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const localCounters = new Map();
@@ -26,10 +27,22 @@ function redisUrl(value) {
 export function getSecurityConfig(env = process.env) {
   const production = env.NODE_ENV === 'production' || env.VERCEL === '1' ||
     env.VERCEL_ENV === 'production' || env.VERCEL_ENV === 'preview';
+  const requestedStore = env.RATE_LIMIT_STORE?.trim() || 'auto';
+  const hasRedis = Boolean(env.UPSTASH_REDIS_REST_URL || env.UPSTASH_REDIS_REST_TOKEN);
+  const hasNeon = Boolean(env.NEON_DATABASE_URL || env.DATABASE_URL);
+  // Existing partial Redis settings still fail closed in auto mode. Choosing
+  // Neon explicitly permits a deliberate migration without touching old keys.
+  const store = requestedStore === 'auto'
+    ? hasRedis ? 'upstash' : hasNeon ? 'neon' : 'memory'
+    : ['upstash', 'neon'].includes(requestedStore) ? requestedStore : null;
+  const durableConfigured = store === 'upstash'
+    ? Boolean(redisUrl(env.UPSTASH_REDIS_REST_URL?.trim()) && env.UPSTASH_REDIS_REST_TOKEN?.trim())
+    : store === 'neon' && Boolean(neonDatabaseUrl(env));
   return {
     production,
-    requiresDurable: production || Boolean(env.UPSTASH_REDIS_REST_URL || env.UPSTASH_REDIS_REST_TOKEN),
-    durableConfigured: Boolean(redisUrl(env.UPSTASH_REDIS_REST_URL?.trim()) && env.UPSTASH_REDIS_REST_TOKEN?.trim()),
+    store,
+    requiresDurable: production || requestedStore !== 'auto' || hasRedis || hasNeon,
+    durableConfigured,
     rateLimit: boundedInteger(env.RATE_LIMIT_REQUESTS, 60, 1, 300),
     windowSeconds: boundedInteger(env.RATE_LIMIT_WINDOW_SECONDS, 600, 60, 3600),
     dailyLimit: boundedInteger(env.DAILY_STAGE_LIMIT, 1000, 1, 100000),
@@ -98,13 +111,14 @@ async function durableLimit(config, env, keys, ttl, fetchImpl) {
   });
   if (!response.ok) throw new Error('Limiter unavailable');
   const data = await response.json();
-  const result = data.result;
-  if (data.error || !Array.isArray(result) || result.length !== 3 ||
-      !result.every(Number.isInteger) || ![0, 1].includes(result[0]) ||
-      (result[0] === 0 && (result[1] < 1 || ![1, 2].includes(result[2])))) {
-    throw new Error('Invalid limiter response');
-  }
-  return result;
+  if (data.error) throw new Error('Invalid limiter response');
+  return data.result;
+}
+
+function validLimitResult(result) {
+  return Array.isArray(result) && result.length === 3 && result.every(Number.isInteger)
+    && (result[0] === 1 ? result[1] === 0 && result[2] === 0
+      : result[0] === 0 && result[1] > 0 && result[1] <= 86400 && [1, 2].includes(result[2]));
 }
 
 function localLimit(config, keys, ttl, now) {
@@ -126,7 +140,7 @@ function localLimit(config, keys, ttl, now) {
  * Return true to continue or false after sending a safe JSON error response.
  * Call once per API stage, after input validation and before any provider call.
  * Production never falls back to process-local counters: serverless workers
- * require the shared Upstash store to enforce per-client and daily budgets.
+ * require a shared Upstash or Neon store to enforce per-client and daily budgets.
  */
 export async function guardApiRequest(req, res, {
   billable = false,
@@ -166,9 +180,12 @@ export async function guardApiRequest(req, res, {
   ];
   const ttl = [config.windowSeconds - seconds % config.windowSeconds, 86400 - seconds % 86400];
   try {
-    const result = config.durableConfigured
-      ? await durableLimit(config, env, keys, ttl, fetchImpl)
-      : localLimit(config, keys, ttl, now);
+    const result = config.store === 'neon'
+      ? await neonLimit(config, env, keys, ttl)
+      : config.durableConfigured
+        ? await durableLimit(config, env, keys, ttl, fetchImpl)
+        : localLimit(config, keys, ttl, now);
+    if (!validLimitResult(result)) throw new Error('Invalid limiter response');
     if (!result[0]) {
       return reply(res, 429, result[2] === 2 ? 'daily_limit_reached' : 'rate_limit_reached',
         result[2] === 2
