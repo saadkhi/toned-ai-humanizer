@@ -23,7 +23,7 @@ export default function DiffReview({ review, decisions, onToggle, onAll }) {
       <div className="space-y-3 rounded-xl border border-border/70 bg-muted/25 px-4 py-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <p className="font-mono text-xs text-muted-foreground">
-            {summary.changed} of {summary.total} paragraph(s) changed · {summary.inserted} words added ·{' '}
+            {summary.changed} of {summary.total} passage(s) changed · {summary.inserted} words added ·{' '}
             {summary.deleted} removed
           </p>
           <div className="flex overflow-hidden rounded-full border border-border/80">
@@ -49,7 +49,7 @@ export default function DiffReview({ review, decisions, onToggle, onAll }) {
           <div className="flex items-center gap-2">
             <Switch id="changes-only" checked={changesOnly} onCheckedChange={setChangesOnly} />
             <Label htmlFor="changes-only" className="text-xs text-muted-foreground">
-              Changed paragraphs only
+              Changed passages only
             </Label>
           </div>
           <div className="flex gap-2">
@@ -76,6 +76,12 @@ export default function DiffReview({ review, decisions, onToggle, onAll }) {
         </p>
       ) : null}
 
+      {review.paragraphs.some((paragraph) => paragraph.beforeCount > 1 || paragraph.afterCount > 1) ? (
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          Some passages contain several paragraphs. Review those paragraphs together when their structure has changed.
+        </p>
+      ) : null}
+
       <div className="space-y-3">
         {visible.map((paragraph) => (
           <DiffParagraph
@@ -90,7 +96,7 @@ export default function DiffReview({ review, decisions, onToggle, onAll }) {
 
       {changesOnly && summary.unchanged ? (
         <p className="font-mono text-xs text-muted-foreground">
-          {summary.unchanged} unchanged paragraph(s) hidden.
+          {summary.unchanged} unchanged passage(s) hidden.
         </p>
       ) : null}
     </div>

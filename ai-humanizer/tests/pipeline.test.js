@@ -15,10 +15,11 @@ async function call(body, method = 'POST') {
 function configure(t, results = []) {
   const originalFetch = globalThis.fetch;
   const names = Object.keys(process.env).filter((name) => /^(GOOGLE|OPENROUTER|SAMBANOVA|CLOUDFLARE)_API_KEY|^UPSTASH_REDIS_|^VERCEL$/.test(name));
-  const previous = Object.fromEntries([...names, 'NODE_ENV', 'VERCEL_ENV', 'GOOGLE_API_KEY_1'].map((name) => [name, process.env[name]]));
+  const previous = Object.fromEntries([...names, 'NODE_ENV', 'VERCEL_ENV', 'GOOGLE_API_KEY_1', 'OPENROUTER_API_KEY_1', 'AI_PROVIDER_MODE'].map((name) => [name, process.env[name]]));
   for (const name of names) delete process.env[name];
   process.env.GOOGLE_API_KEY_1 = 'synthetic-unit-test-key';
   process.env.NODE_ENV = 'test';
+  process.env.AI_PROVIDER_MODE = 'configured';
   delete process.env.VERCEL_ENV;
   let calls = 0;
   globalThis.fetch = async () => {
@@ -256,4 +257,127 @@ test('newly introduced certainty shifts can be flagged without a source hedge ID
   }
   assert.equal(job.status, 'needs_review');
   assert.ok(job.unresolved_flags.some((flag) => flag.kind === 'certainty' && flag.value === 'probably'));
+});
+
+test('valid extraction paragraph indices work for CRLF and whitespace-only blank lines', async (t) => {
+  configure(t);
+  for (const separator of ['\r\n\r\n', '\n \n', '\r\n\t\r\n']) {
+    const document = `Introduction.${separator}${source}`;
+    const facts = Object.fromEntries(Object.entries(extraction).map(([key, values]) => [key, values.map((item) => ({ ...item, paragraph: 1 }))]));
+    globalThis.fetch = async (_url, request) => {
+      const prompt = JSON.parse(request.body).contents[0].parts[0].text;
+      assert.ok(prompt.includes('<paragraph index="1">'));
+      return Response.json({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify(facts) }] } }] });
+    };
+    const response = await call({ stage: 'extract', job: { source_text: document } });
+    assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+    assert.equal(response.body.patch.extraction.claims[0].source_start, document.indexOf(source));
+  }
+});
+
+test('source indentation survives validation, provider generation, and assembly', async (t) => {
+  const indented = '    The trial may include 42 participants.\r\n';
+  configure(t, [extraction, diagnosis, source]);
+  const job = { source_text: indented };
+  for (const stage of ['extract', 'diagnose', 'rewrite', 'assemble']) {
+    const response = await call({ stage, job });
+    assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+    Object.assign(job, response.body.patch);
+  }
+  assert.equal(job.source_text, indented);
+  assert.equal(job.rewritten_text, indented);
+});
+
+test('accepted Unicode documents are rewritten in bounded sections without inserting paragraph seams', async (t) => {
+  const document = '这是一个测试段落。'.repeat(2000);
+  configure(t, [{ claims: [], numbers: [], named_entities: [], citations: [], quotations: [], hedge_markers: [] }, diagnosis]);
+  const job = { source_text: document };
+  const extracted = await call({ stage: 'extract', job });
+  assert.equal(extracted.statusCode, 200, JSON.stringify(extracted.body));
+  Object.assign(job, extracted.body.patch);
+  assert.ok(extracted.body.chunk_count > 1);
+  Object.assign(job, (await call({ stage: 'diagnose', job })).body.patch);
+  globalThis.fetch = async (_url, request) => {
+    const prompt = JSON.parse(request.body).contents[0].parts[0].text;
+    const text = prompt.match(/<text>\n([\s\S]*?)\n<\/text>$/)?.[1];
+    assert.ok(text.length <= 4000);
+    return Response.json({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text }] } }] });
+  };
+  for (let index = 0; index < extracted.body.chunk_count; index++) {
+    const response = await call({ stage: 'rewrite', chunk_index: index, job });
+    assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+    Object.assign(job, response.body.patch);
+  }
+  Object.assign(job, (await call({ stage: 'assemble', job })).body.patch);
+  assert.equal(job.rewritten_text, document);
+});
+
+test('model metadata records the successful provider fallback instead of configured primary', async (t) => {
+  const names = ['OPENROUTER_API_KEY_1', 'OPENROUTER_MODEL_FAST', 'LLM_MAX_ATTEMPTS'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  configure(t);
+  t.after(() => { for (const [name, value] of Object.entries(previous)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; } });
+  process.env.OPENROUTER_API_KEY_1 = 'synthetic-fallback-metadata-key';
+  process.env.OPENROUTER_MODEL_FAST = 'test/actual-fallback-model';
+  process.env.LLM_MAX_ATTEMPTS = '2';
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('generativelanguage.googleapis.com')) return new Response('', { status: 401 });
+    assert.equal(String(url), 'https://openrouter.ai/api/v1/chat/completions');
+    return Response.json({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(extraction) } }], usage: { prompt_tokens: 11, completion_tokens: 12 } });
+  };
+  const response = await call({ stage: 'extract', job: { source_text: source } });
+  assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+  assert.equal(response.body.patch.model_fast, 'openrouter/test/actual-fallback-model');
+  assert.equal(response.body.patch.provider_fast, 'openrouter');
+  assert.equal(response.body.patch.provider, 'openrouter');
+  assert.equal(response.body.patch.input_tokens, 11);
+  assert.equal(response.body.patch.output_tokens, 12);
+});
+
+test('text rewriting persists the last successful quality model without losing fast metadata', async (t) => {
+  const previous = process.env.GOOGLE_MODEL_QUALITY;
+  t.after(() => { if (previous === undefined) delete process.env.GOOGLE_MODEL_QUALITY; else process.env.GOOGLE_MODEL_QUALITY = previous; });
+  process.env.GOOGLE_MODEL_QUALITY = 'test-quality-response-model';
+  const { job } = await throughAssembly(t);
+  assert.ok(job.model_fast.startsWith('google/'));
+  assert.equal(job.model_quality, 'google/test-quality-response-model');
+  assert.equal(job.provider_quality, 'google');
+  assert.equal(job.provider, 'google');
+});
+
+test('free-router JSON and prose stages keep cost zero while recording real usage and actual models', async (t) => {
+  configure(t);
+  process.env.AI_PROVIDER_MODE = 'free';
+  process.env.OPENROUTER_API_KEY_1 = 'synthetic-free-route-only-key';
+  const results = [extraction, diagnosis, source, audit];
+  globalThis.fetch = async (url, request) => {
+    assert.equal(String(url), 'https://openrouter.ai/api/v1/chat/completions');
+    assert.equal(JSON.parse(request.body).model, 'openrouter/free');
+    const result = results.shift();
+    assert.ok(result, 'Unexpected free-route call');
+    return Response.json({ model: 'test/selected-model:free', choices: [{ finish_reason: 'stop', message: { content: typeof result === 'string' ? result : JSON.stringify(result) } }], usage: { prompt_tokens: 100, completion_tokens: 200 } });
+  };
+  const job = { source_text: source };
+  for (const stage of ['extract', 'diagnose', 'rewrite', 'assemble', 'audit', 'finalize']) {
+    const response = await call({ stage, job });
+    assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+    Object.assign(job, response.body.patch);
+    if (['extract', 'diagnose', 'rewrite', 'audit'].includes(stage)) {
+      assert.equal(response.body.patch.cost_estimate, 0);
+      assert.ok(response.body.patch.input_tokens > 0);
+      assert.equal(response.body.patch.provider, 'openrouter');
+    }
+  }
+  assert.equal(results.length, 0);
+  assert.equal(job.cost_estimate, 0);
+  assert.equal(job.model_fast, 'openrouter/test/selected-model:free');
+  assert.equal(job.model_quality, 'openrouter/test/selected-model:free');
+});
+
+test('configured paid-provider stages retain an approximate nonzero estimate', async (t) => {
+  configure(t, [extraction]);
+  const response = await call({ stage: 'extract', job: { source_text: source } });
+  assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+  assert.ok(response.body.patch.cost_estimate > 0);
+  assert.equal(response.body.patch.cost_estimate, 0.00006);
 });

@@ -33,7 +33,7 @@ export default function AuditPanel({ audit, flags }) {
   const shifts = (audit.certainty || []).filter((entry) => entry.status && entry.status !== 'none');
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 [overflow-wrap:anywhere]">
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <Stat label="Preserved" value={counts.preserved || 0} tone="text-success" />
         <Stat label="Altered" value={counts.altered || 0} tone={counts.altered ? 'text-destructive' : undefined} />
@@ -42,6 +42,7 @@ export default function AuditPanel({ audit, flags }) {
       </div>
 
       <p className="text-sm leading-relaxed text-muted-foreground">{audit.summary}</p>
+      <p className="text-xs leading-relaxed text-muted-foreground">This automated comparison checks consistency with your original. It does not verify the underlying facts or approve the text for publication.</p>
 
       {flags?.length ? (
         <div className="rounded-xl border border-warning/40 bg-warning/10 p-4">

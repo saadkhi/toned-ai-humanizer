@@ -13,6 +13,7 @@ export default function health(req, res) {
   const protectionConfigured = !security.requiresDurable || security.durableConfigured;
   const configured = provider.configured && protectionConfigured;
   return res.status(configured ? 200 : 503).json({
+    mode: provider.mode,
     configured,
     providerConfigured: provider.configured,
     protectionConfigured,

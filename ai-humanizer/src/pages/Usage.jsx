@@ -16,11 +16,12 @@ function Stat({ label, value, note }) {
 export default function Usage() {
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
 
   useEffect(() => {
-    jobStore.RewriteJob.list('-created_date', 200)
+    jobStore.RewriteJob.list('-created_date', Infinity)
       .then(setJobs)
-      .catch(() => setJobs([]))
+      .catch((loadError) => setError(loadError.message || 'Your usage could not be loaded.'))
       .finally(() => setLoading(false));
   }, []);
 
@@ -32,18 +33,20 @@ export default function Usage() {
         <p className="eyebrow">Usage</p>
         <h1 className="mt-3 text-3xl sm:text-4xl">What you have processed.</h1>
         <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-          Measured from your own rewrites — token use, word counts and the estimated model cost of each
-          job, not a guess.
+          Counts and estimated model costs from the rewrite history saved in this browser.
+          Deleted, expired and unsaved rewrites are not included.
         </p>
       </header>
 
-      {loading ? (
+      {error ? <p role="alert" className="rounded-xl border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">{error}</p> : null}
+
+      {!error && loading ? (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {[0, 1, 2, 3].map((key) => (
             <div key={key} className="h-24 animate-pulse rounded-2xl border border-border/70 bg-muted/40" />
           ))}
         </div>
-      ) : (
+      ) : !error ? (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <Stat label="Words this month" value={usage.monthWords.toLocaleString()} />
           <Stat label="Rewrites this month" value={usage.monthJobs} />
@@ -54,9 +57,9 @@ export default function Usage() {
             note={`$${usage.cost.toFixed(4)} across ${usage.jobs} job(s)`}
           />
         </div>
-      )}
+      ) : null}
 
-      <section className="rounded-2xl border border-border/80 bg-card p-6">
+      {!error ? <section className="rounded-2xl border border-border/80 bg-card p-6">
         <p className="eyebrow">Words processed per month</p>
         <div className="mt-6 h-56 w-full">
           <ResponsiveContainer width="100%" height="100%">
@@ -84,11 +87,10 @@ export default function Usage() {
             </BarChart>
           </ResponsiveContainer>
         </div>
-      </section>
+      </section> : null}
 
       <p className="text-xs leading-relaxed text-muted-foreground">
-        Cost is estimated from the tokens each stage reported and the per-model prices configured for
-        this app.
+        Cost is an estimate based on reported token counts and configured pricing. Provider invoices may differ.
       </p>
     </div>
   );

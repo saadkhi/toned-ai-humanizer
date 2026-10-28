@@ -64,7 +64,7 @@ export const PROMPTS = {
 
 Rules:
 - Quote spans verbatim from the source, short and exact. Split quotations spanning blank-line-separated paragraphs into one span per paragraph. Record repeated facts or uncertainty markers separately for each occurrence.
-- "paragraph" is the zero-based index of the paragraph the item came from.
+- "paragraph" is the explicit zero-based index on the <paragraph> containing the item. Use the supplied labels; never guess from visual wrapping or line breaks.
 - claims: each distinct assertion the document makes.
 - numbers: every quantity, percentage, date, amount, measurement or ranking.
 - named_entities: people, organisations, places, products, laws, studies.
@@ -96,7 +96,7 @@ Rules:
 - Report every certainty shift in the "certainty" array: status "strengthened", "weakened" or "none".
 - Report format violations in format_violations.
 - Copy source_id from each extraction entry into its audit item. Include exactly one item for every source_id, including repeated values from different occurrences. For a new added claim, use source_id: null. Also scan the rewrite against the FULL ORIGINAL for new claims or details and report them as added. Do not treat the extraction as exhaustive. Include exactly one certainty entry for every extracted hedge marker, even when unchanged; copy that hedge marker's source_id. If the rewrite introduces a new uncertainty marker absent from the original, report its shift with source_id: null and status strengthened or weakened.
-- summary is one sentence on whether the rewrite is safe to publish.`,
+- summary describes consistency findings in one sentence. Never certify factual truth or describe a rewrite as safe to publish, guaranteed, or verified accurate. Human review remains necessary.`,
     maxTokens: 10000,
   },
   repair: {
@@ -125,7 +125,7 @@ Rules:
 
 const span = (key) => z.object({ [key]: z.string().min(1).max(20000), paragraph: z.number().int().nonnegative(), source_id: z.string().optional() });
 const strings = z.array(z.string().max(20000)).max(1000);
-const text = z.string().trim().min(1).max(120000);
+const text = z.string().min(1).max(120000).refine((value) => value.trim().length > 0);
 const list = (schema) => z.array(schema).max(2000);
 export const STAGE_SCHEMAS = {
   extract: z.object({

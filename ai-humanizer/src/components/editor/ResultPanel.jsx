@@ -14,6 +14,9 @@ export default function ResultPanel({ job, review, decisions, onToggle, onAll, t
   const [copyError, setCopyError] = useState(false);
   const changedReview = Object.values(decisions).some((accepted) => accepted === false);
   const flags = job.unresolved_flags || [];
+  const completedAudit = job.status === 'completed' && job.audit
+    && ['items', 'certainty', 'format_violations'].every((field) => Array.isArray(job.audit[field]))
+    && typeof job.audit.summary === 'string';
 
   const copy = async () => {
     try {
@@ -44,11 +47,15 @@ export default function ResultPanel({ job, review, decisions, onToggle, onAll, t
             These items remain unresolved after automated checks. Compare them with your original in the Claim audit tab.
           </p>
         </div>
-      ) : (
+      ) : completedAudit ? (
         <div className="flex items-center gap-2 rounded-2xl border border-success/35 bg-success/10 p-4 text-sm text-success">
           <Check className="h-4 w-4" />
           Automated checks found no unresolved issues. Please review the result for accuracy.
         </div>
+      ) : (
+        <p role="status" className="rounded-2xl border border-warning/45 bg-warning/10 p-4 text-sm text-warning">
+          This saved result has no completed audit; review it before use.
+        </p>
       )}
 
       {changedReview ? <p role="status" className="rounded-xl border border-border p-3 text-sm text-muted-foreground">You have rejected changes. The audit describes the AI rewrite before your edits; review your final text again before sharing.</p> : null}
@@ -56,8 +63,8 @@ export default function ResultPanel({ job, review, decisions, onToggle, onAll, t
 
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h2 className="text-2xl">{job.title || 'Your rewrite'}</h2>
-          <p className="mt-1 font-mono text-xs text-muted-foreground">
+          <h2 className="break-words text-2xl [overflow-wrap:anywhere]">{job.title || 'Your rewrite'}</h2>
+          <p className="mt-1 break-words font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]">
             {styleLabel(job.style, job.custom_style)} · {job.source_words || 0} words in ·{' '}
             {job.result_words || 0} out · ${Number(job.cost_estimate || 0).toFixed(4)} ·{' '}
             {job.repair_loops || 0} repair pass(es)
@@ -81,7 +88,7 @@ export default function ResultPanel({ job, review, decisions, onToggle, onAll, t
       </div>
 
       <Tabs defaultValue="changes">
-        <TabsList>
+        <TabsList className="grid h-auto w-full grid-cols-2 sm:inline-flex sm:h-9 sm:w-auto">
           <TabsTrigger value="changes">Tracked changes</TabsTrigger>
           <TabsTrigger value="clean">Clean result</TabsTrigger>
           <TabsTrigger value="audit">Claim audit</TabsTrigger>
@@ -91,11 +98,7 @@ export default function ResultPanel({ job, review, decisions, onToggle, onAll, t
           <DiffReview review={review} decisions={decisions} onToggle={onToggle} onAll={onAll} />
         </TabsContent>
         <TabsContent value="clean" className="mt-5">
-          <article className="prose-result rounded-2xl border border-border/80 bg-card p-6 leading-relaxed">
-            {text.split(/\n{2,}/).map((paragraph, index) => (
-              <p key={index}>{paragraph}</p>
-            ))}
-          </article>
+          <article className="prose-result whitespace-pre-wrap rounded-2xl border border-border/80 bg-card p-6 leading-relaxed [overflow-wrap:anywhere]">{text}</article>
         </TabsContent>
         <TabsContent value="audit" className="mt-5">
           <AuditPanel audit={job.audit} flags={flags} />

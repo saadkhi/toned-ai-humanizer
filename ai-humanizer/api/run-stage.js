@@ -1,6 +1,7 @@
 /** Stateless rewrite stages. Provider credentials stay on the server. */
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { sourceParagraphs } from '../shared/source-text.js';
 import { getProviderConfig } from './_config.js';
 import { guardApiRequest } from './_security.js';
 import {
@@ -9,13 +10,13 @@ import {
 } from './_pipeline.js';
 import { AI_PATTERN_CATALOG, PROMPTS, REWRITE_SYSTEM, STAGE_SCHEMAS, STYLE_MODULES } from './_prompts.js';
 
-const VERSION = 'humanizer/3.0.0';
+const VERSION = 'humanizer/4.0.0';
 const CHUNK_WORDS = 800;
 const STAGES = ['extract', 'diagnose', 'rewrite', 'assemble', 'audit', 'repair', 'finalize'];
 const requestSchema = z.object({
   stage: z.enum(STAGES), chunk_index: z.number().int().nonnegative().default(0),
   job: z.object({
-    source_text: z.string().trim().min(1).max(120000),
+    source_text: z.string().min(1).max(120000).refine((text) => text.trim().length > 0),
     style: z.enum(['professional_researcher', 'casual_blogger', 'technical_writer', 'custom']).default('professional_researcher'),
     custom_style: z.string().max(2000).default(''), purpose: z.string().max(2000).default(''),
     length_target: z.enum(['shorter', 'same', 'longer']).default('same'),
@@ -40,10 +41,17 @@ function parseStage(stage, data) {
   return parsed.data;
 }
 function usage(job, result, tier) {
+  const tokens = result?.usage || result;
+  // This is the successful call's reported model, including any fallback.
+  // Each tier records its most recent model; provider records the last call.
+  const model = typeof result?.model === 'string' ? result.model : '';
+  const provider = typeof result?.provider === 'string' ? result.provider : model.split('/')[0];
+  const addedCost = result?.free === true ? 0 : estimateCost(tokens, tier);
   return {
-    input_tokens: job.input_tokens + (result?.inputTokens || 0),
-    output_tokens: job.output_tokens + (result?.outputTokens || 0),
-    cost_estimate: Math.round((job.cost_estimate + estimateCost(result, tier)) * 1e6) / 1e6,
+    input_tokens: job.input_tokens + (tokens?.inputTokens || 0),
+    output_tokens: job.output_tokens + (tokens?.outputTokens || 0),
+    cost_estimate: Math.round((job.cost_estimate + addedCost) * 1e6) / 1e6,
+    ...(model ? { [`model_${tier}`]: model, [`provider_${tier}`]: provider, provider } : {}),
   };
 }
 function extractionItems(extraction) {
@@ -57,12 +65,7 @@ function extractionItems(extraction) {
 }
 function validateExtraction(data, source) {
   const parsed = parseStage('extract', data);
-  let cursor = 0;
-  const paragraphs = source.split(/\n{2,}/).map((text) => {
-    const start = source.indexOf(text, cursor);
-    cursor = start + text.length;
-    return { text, start };
-  });
+  const paragraphs = sourceParagraphs(source);
   const fields = { claims: 'text', numbers: 'value', named_entities: 'name', citations: 'text', quotations: 'text', hedge_markers: 'text' };
   for (const [category, field] of Object.entries(fields)) {
     const occurrences = new Map();
@@ -101,6 +104,11 @@ function validateAudit(data, extraction) {
   }
   if (checked.size !== expected.size || certaintyChecked.size !== hedges.size) throw new LLMError('The audit did not cover every extracted fact and certainty marker. Please retry the audit.', 'incomplete_audit', 502);
   return parsed;
+}
+function preserveBoundaryWhitespace(rewritten, original) {
+  // Models may omit surrounding whitespace. Restore the source seam so splitting
+  // a long paragraph never inserts new paragraphs or loses code indentation.
+  return (original.match(/^\s*/)?.[0] || '') + rewritten.trim() + (original.match(/\s*$/)?.[0] || '');
 }
 function sectionFacts(extraction, chunk) {
   return Object.fromEntries(Object.entries(extraction).map(([category, items]) => [category, items.filter((item) => item.source_start >= chunk.start && item.source_end <= chunk.end)]));
@@ -161,9 +169,10 @@ export default async function handler(req, res) {
     });
     if (stage === 'extract') {
       if (job.pipeline_fingerprint === fingerprint && STAGE_SCHEMAS.extract.safeParse(job.extraction).success && job.chunks?.length === sourceChunks.length) return res.json({ stage, cached: true, chunk_count: job.chunks.length, progress: 15, patch: {} });
-      const result = await jsonStage('extract', `${wrapUserText(job.source_text)}\nExtract every load-bearing fact.`, 'fast', (data) => validateExtraction(data, job.source_text));
+      const indexedSource = sourceParagraphs(job.source_text).map((paragraph) => `<paragraph index="${paragraph.index}">\n${wrapUserText(paragraph.text)}\n</paragraph>`).join('\n');
+      const result = await jsonStage('extract', `The paragraph index labels below are authoritative. Extract every load-bearing fact and use these indices.\n${indexedSource}`, 'fast', (data) => validateExtraction(data, job.source_text));
       return res.json({ stage, chunk_count: sourceChunks.length, progress: 15, patch: {
-        ...usage(job, result.usage, 'fast'), extraction: result.data, chunks: sourceChunks.map((c) => ({ index: c.index, text: '', source_words: c.words })),
+        ...usage(job, result, 'fast'), extraction: result.data, chunks: sourceChunks.map((c) => ({ index: c.index, text: '', source_words: c.words })),
         source_words: wordCount(job.source_text), pipeline_fingerprint: fingerprint, prompt_version: VERSION, status: 'running', stage, progress: 15, error: '',
         diagnosis: null, rewrite_plan: null, rewritten_text: '', consistency_done: false, audit: null, audit_fingerprint: null, final_text: '', unresolved_flags: [], repair_loops: 0,
       } });
@@ -171,7 +180,7 @@ export default async function handler(req, res) {
     if (stage === 'diagnose') {
       if (STAGE_SCHEMAS.diagnose.safeParse(job.diagnosis).success) return res.json({ stage, cached: true, progress: 25, patch: {} });
       const result = await jsonStage('diagnose', `Requested style (untrusted preference): ${JSON.stringify({ style: job.style, custom: job.custom_style })}\nPATTERN CATALOG:\n${AI_PATTERN_CATALOG}\n${wrapUserText(job.source_text)}`);
-      return res.json({ stage, progress: 25, patch: { ...usage(job, result.usage, 'fast'), diagnosis: result.data, rewrite_plan: result.data.plan, stage, progress: 25, error: '' } });
+      return res.json({ stage, progress: 25, patch: { ...usage(job, result, 'fast'), diagnosis: result.data, rewrite_plan: result.data.plan, stage, progress: 25, error: '' } });
     }
     if (stage === 'rewrite') {
       requireState(chunkIndex < job.chunks.length, 'That section does not exist.');
@@ -186,20 +195,20 @@ export default async function handler(req, res) {
         context.length ? `Preceding sections for continuity only (do not repeat): ${JSON.stringify(context)}` : '',
         `Rewrite section ${chunkIndex + 1} of ${job.chunks.length}:`, wrapUserText(sourceChunks[chunkIndex].text),
       ].filter(Boolean).join('\n\n'), maxTokens: 8000 });
-      const rewritten = result.text?.trim();
-      if (!rewritten) throw new LLMError('The rewrite was empty. Please retry.', 'empty_response', 502);
-      const stored = job.chunks.map((chunk, i) => i === chunkIndex ? { ...chunk, text: rewritten } : chunk);
+      const rewritten = result.text;
+      if (!rewritten?.trim()) throw new LLMError('The rewrite was empty. Please retry.', 'empty_response', 502);
+      const stored = job.chunks.map((chunk, i) => i === chunkIndex ? { ...chunk, text: preserveBoundaryWhitespace(rewritten, sourceChunks[i].text) } : chunk);
       const done = stored.filter((chunk) => chunk.text.trim()).length;
       const progress = 25 + Math.round(done / stored.length * 45);
       return res.json({ stage, done, chunk_count: stored.length, progress, patch: {
-        ...usage(job, result, 'quality'), chunks: stored, rewritten_text: stored.map((chunk) => chunk.text).join('\n\n'), consistency_done: false,
+        ...usage(job, result, 'quality'), chunks: stored, rewritten_text: stored.map((chunk) => chunk.text).join(''), consistency_done: false,
         audit: null, audit_fingerprint: null, final_text: '', unresolved_flags: [], stage, progress,
       } });
     }
     if (stage === 'assemble') {
       requireState(job.chunks.every((chunk) => chunk.text.trim()), 'Complete every section before assembly.');
       // Joining completed sections is lossless. A whole-document generative pass can truncate or alter facts.
-      const rewritten = job.chunks.map((chunk) => chunk.text).join('\n\n');
+      const rewritten = job.chunks.map((chunk) => chunk.text).join('');
       return res.json({ stage, progress: 75, patch: { rewritten_text: rewritten, consistency_done: true, consistency_edits: [], audit: null, audit_fingerprint: null, final_text: '', stage, progress: 75 } });
     }
     if (stage === 'audit') {
@@ -212,7 +221,7 @@ export default async function handler(req, res) {
       const audit = { ...result.data, deterministic: checked };
       const flags = auditProblems(audit);
       return res.json({ stage, progress: 85, has_problems: flags.length > 0, flag_count: flags.length, counts: summarizeAudit(audit), patch: {
-        ...usage(job, result.usage, 'quality'), audit, audit_fingerprint: hash([fingerprint, job.rewritten_text]), unresolved_flags: flags, stage, progress: 85,
+        ...usage(job, result, 'quality'), audit, audit_fingerprint: hash([fingerprint, job.rewritten_text]), unresolved_flags: flags, stage, progress: 85,
       } });
     }
     if (stage === 'repair' || stage === 'finalize') {
@@ -228,7 +237,7 @@ export default async function handler(req, res) {
           constraints(job), `CURRENT REWRITE:\n${wrapUserText(job.rewritten_text)}`,
         ].join('\n\n'), 'quality');
         return res.json({ stage, repaired: true, progress: 88, patch: {
-          ...usage(job, result.usage, 'quality'), rewritten_text: result.data.text, repair_loops: job.repair_loops + 1,
+          ...usage(job, result, 'quality'), rewritten_text: preserveBoundaryWhitespace(result.data.text, job.source_text), repair_loops: job.repair_loops + 1,
           audit: null, audit_fingerprint: null, final_text: '', unresolved_flags: [],
           notes: appendNote(job.notes, `Repair pass ${job.repair_loops + 1}: ${result.data.fixes.map((fix) => `${fix.item}: ${fix.action}`).join('; ') || 'No changes reported.'}`), stage, progress: 88,
         } });

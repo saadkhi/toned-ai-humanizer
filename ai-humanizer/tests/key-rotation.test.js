@@ -5,6 +5,7 @@ import health from '../api/health.js';
 
 test('successive runtime configurations rotate through primary, alias, second and third keys', () => {
   const env = {
+    AI_PROVIDER_MODE: 'configured',
     GOOGLE_API_KEY_1: 'synthetic-google-primary',
     GOOGLE_API_KEY: 'synthetic-google-alias',
     GOOGLE_API_KEY_2: 'synthetic-google-second',
@@ -16,7 +17,7 @@ test('successive runtime configurations rotate through primary, alias, second an
 });
 
 test('normalized duplicate aliases preserve the existing runtime cursor', () => {
-  const env = { GOOGLE_API_KEY_1: ' synthetic-dedup-first ', GOOGLE_API_KEY: 'synthetic-dedup-first', GOOGLE_API_KEY_2: 'synthetic-dedup-second' };
+  const env = { AI_PROVIDER_MODE: 'configured', GOOGLE_API_KEY_1: ' synthetic-dedup-first ', GOOGLE_API_KEY: 'synthetic-dedup-first', GOOGLE_API_KEY_2: 'synthetic-dedup-second' };
   const first = getProviderConfig(env);
   assert.equal(first.pools.google.size, 2);
   assert.equal(first.pools.google.next(), 'synthetic-dedup-first');
@@ -26,7 +27,7 @@ test('normalized duplicate aliases preserve the existing runtime cursor', () => 
 });
 
 test('fresh configuration loading stays isolated from runtime rotation', () => {
-  const env = { GOOGLE_API_KEY_1: 'synthetic-isolated-first', GOOGLE_API_KEY_2: 'synthetic-isolated-second' };
+  const env = { AI_PROVIDER_MODE: 'configured', GOOGLE_API_KEY_1: 'synthetic-isolated-first', GOOGLE_API_KEY_2: 'synthetic-isolated-second' };
   assert.equal(getProviderConfig(env).pools.google.next(), env.GOOGLE_API_KEY_1);
   const fresh = loadProviderConfig(env);
   assert.equal(fresh.pools.google.next(), env.GOOGLE_API_KEY_1);
@@ -36,7 +37,7 @@ test('fresh configuration loading stays isolated from runtime rotation', () => {
 
 test('health checks never advance the runtime key cursor', t => {
   const originalEnv = process.env;
-  process.env = { NODE_ENV: 'test', GOOGLE_API_KEY: 'synthetic-health-first', GOOGLE_API_KEY_2: 'synthetic-health-second' };
+  process.env = { NODE_ENV: 'test', AI_PROVIDER_MODE: 'configured', GOOGLE_API_KEY: 'synthetic-health-first', GOOGLE_API_KEY_2: 'synthetic-health-second' };
   t.after(() => { process.env = originalEnv; });
   assert.equal(getProviderConfig().pools.google.next(), 'synthetic-health-first');
   for (let index = 0; index < 3; index++) {
@@ -55,6 +56,7 @@ test('health checks never advance the runtime key cursor', t => {
 
 test('changed keys replace only their provider pool and discard removed credentials', () => {
   const env = {
+    AI_PROVIDER_MODE: 'configured',
     GOOGLE_API_KEY_1: 'synthetic-replaced-first', GOOGLE_API_KEY_2: 'synthetic-replaced-second',
     OPENROUTER_API_KEY_1: 'synthetic-router-first', OPENROUTER_API_KEY_2: 'synthetic-router-second',
   };
@@ -74,7 +76,7 @@ test('changed keys replace only their provider pool and discard removed credenti
 });
 
 test('changed model bindings reset failure state before reusing credentials', () => {
-  const env = { GOOGLE_API_KEY_1: 'synthetic-model-first', GOOGLE_API_KEY_2: 'synthetic-model-second' };
+  const env = { AI_PROVIDER_MODE: 'configured', GOOGLE_API_KEY_1: 'synthetic-model-first', GOOGLE_API_KEY_2: 'synthetic-model-second' };
   let previous = getProviderConfig(env).pools.google;
   for (const override of [{ GOOGLE_MODEL_FAST: 'synthetic-fast-model' }, { GOOGLE_MODEL_FAST: 'synthetic-fast-model', GOOGLE_MODEL_QUALITY: 'synthetic-quality-model' }]) {
     for (let index = 0; index < 3; index++) previous.markFailed(env.GOOGLE_API_KEY_1);
@@ -87,12 +89,13 @@ test('changed model bindings reset failure state before reusing credentials', ()
 
 test('Cloudflare account changes and incomplete bindings invalidate the previous pool', () => {
   const env = {
-    CLOUDFLARE_ACCOUNT_ID: 'synthetic-account-one',
+    AI_PROVIDER_MODE: 'configured',
+    CLOUDFLARE_ACCOUNT_ID: '11111111111111111111111111111111',
     CLOUDFLARE_API_KEY_1: 'synthetic-cloudflare-first', CLOUDFLARE_API_KEY_2: 'synthetic-cloudflare-second',
   };
   const first = getProviderConfig(env).pools.cloudflare;
   first.next();
-  const changed = getProviderConfig({ ...env, CLOUDFLARE_ACCOUNT_ID: 'synthetic-account-two' }).pools.cloudflare;
+  const changed = getProviderConfig({ ...env, CLOUDFLARE_ACCOUNT_ID: '22222222222222222222222222222222' }).pools.cloudflare;
   assert.notEqual(changed, first);
   assert.equal(changed.next(), env.CLOUDFLARE_API_KEY_1);
   assert.equal(getProviderConfig({ ...env, CLOUDFLARE_ACCOUNT_ID: ' ' }).pools.cloudflare.size, 0);
@@ -102,13 +105,36 @@ test('Cloudflare account changes and incomplete bindings invalidate the previous
 });
 
 test('each provider retains only its current binding rather than accumulating old pools', () => {
-  const firstEnv = { GOOGLE_API_KEY_1: 'synthetic-bounded-first', GOOGLE_API_KEY_2: 'synthetic-bounded-second' };
+  const firstEnv = { AI_PROVIDER_MODE: 'configured', GOOGLE_API_KEY_1: 'synthetic-bounded-first', GOOGLE_API_KEY_2: 'synthetic-bounded-second' };
   const first = getProviderConfig(firstEnv).pools.google;
   first.next();
   for (let index = 0; index < 8; index++) {
-    getProviderConfig({ GOOGLE_API_KEY_1: `synthetic-bounded-replacement-${index}` });
+    getProviderConfig({ AI_PROVIDER_MODE: 'configured', GOOGLE_API_KEY_1: `synthetic-bounded-replacement-${index}` });
   }
   const restored = getProviderConfig(firstEnv).pools.google;
   assert.notEqual(restored, first);
   assert.equal(restored.next(), firstEnv.GOOGLE_API_KEY_1);
+});
+
+test('free mode rotates OpenRouter keys without retaining pools across mode changes', () => {
+  const env = { OPENROUTER_API_KEY: 'synthetic-free-rotation-first', OPENROUTER_API_KEY_2: 'synthetic-free-rotation-second' };
+  const first = getProviderConfig(env).pools.openrouter;
+  assert.equal(first.next(), env.OPENROUTER_API_KEY);
+  assert.equal(getProviderConfig(env).pools.openrouter.next(), env.OPENROUTER_API_KEY_2);
+  const configured = getProviderConfig({ ...env, AI_PROVIDER_MODE: 'configured', OPENROUTER_MODEL_FAST: 'openrouter/free', OPENROUTER_MODEL_QUALITY: 'openrouter/free' }).pools.openrouter;
+  assert.notEqual(configured, first);
+  assert.equal(configured.next(), env.OPENROUTER_API_KEY);
+  const freeAgain = getProviderConfig(env).pools.openrouter;
+  assert.notEqual(freeAgain, configured);
+  assert.equal(freeAgain.next(), env.OPENROUTER_API_KEY);
+});
+
+test('invalid free-model bindings disable and discard the cached OpenRouter pool', () => {
+  const env = { OPENROUTER_API_KEY: 'synthetic-free-binding-first', OPENROUTER_API_KEY_2: 'synthetic-free-binding-second' };
+  const first = getProviderConfig(env).pools.openrouter;
+  first.next();
+  assert.equal(getProviderConfig({ ...env, OPENROUTER_FREE_MODEL: 'google/gemini-2.5-pro' }).pools.openrouter.size, 0);
+  const restored = getProviderConfig(env).pools.openrouter;
+  assert.notEqual(restored, first);
+  assert.equal(restored.next(), env.OPENROUTER_API_KEY);
 });

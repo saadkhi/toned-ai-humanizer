@@ -19,12 +19,16 @@ import { Trash2 } from 'lucide-react';
 
 export default function HistoryRow({ job, onDeleted }) {
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
 
   const remove = async () => {
     setBusy(true);
+    setError('');
     try {
       await jobStore.RewriteJob.delete(job.id);
       onDeleted(job.id);
+    } catch (deleteError) {
+      setError(deleteError.message || 'This rewrite could not be deleted. Please try again.');
     } finally {
       setBusy(false);
     }
@@ -32,9 +36,9 @@ export default function HistoryRow({ job, onDeleted }) {
 
   return (
     <li className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-border/80 bg-card p-4">
-      <div className="min-w-0">
+      <div className="min-w-0 max-w-full">
         <p className="truncate font-heading text-base">{job.title || 'Untitled rewrite'}</p>
-        <p className="mt-1 font-mono text-xs text-muted-foreground">
+        <p className="mt-1 break-words font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]">
           {styleLabel(job.style, job.custom_style)} · {job.source_words || 0} words in ·{' '}
           {job.result_words || 0} out · {formatDate(job.created_date)}
         </p>
@@ -69,6 +73,7 @@ export default function HistoryRow({ job, onDeleted }) {
           </AlertDialogContent>
         </AlertDialog>
       </div>
+      {error ? <p role="alert" className="w-full text-sm text-destructive">{error}</p> : null}
     </li>
   );
 }

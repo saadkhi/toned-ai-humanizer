@@ -30,21 +30,24 @@ export default function Settings() {
 
   const load = async () => {
     setLoading(true);
-    const [settings, jobs] = await Promise.all([
-      jobStore.UserSetting.list('-created_date', 1),
-      jobStore.RewriteJob.list('-created_date', 200),
-    ]);
-    const setting = settings?.[0];
-    if (setting) {
-      setSettingId(setting.id);
-      setRetention(setting.retention_days ?? 30);
-      setSavedRetention(setting.retention_days ?? 30);
+    try {
+      const [settings, jobs] = await Promise.all([
+        jobStore.UserSetting.list('-created_date', 1),
+        jobStore.RewriteJob.list('-created_date', Infinity),
+      ]);
+      const setting = settings?.[0];
+      if (setting) {
+        setSettingId(setting.id);
+        setRetention(setting.retention_days ?? 30);
+        setSavedRetention(setting.retention_days ?? 30);
+      }
+      setSummary({
+        jobs: jobs.length,
+        words: jobs.reduce((t, j) => t + (j.source_words || 0) + (j.result_words || 0), 0),
+      });
+    } finally {
+      setLoading(false);
     }
-    setSummary({
-      jobs: jobs.length,
-      words: jobs.reduce((t, j) => t + (j.source_words || 0) + (j.result_words || 0), 0),
-    });
-    setLoading(false);
   };
 
   useEffect(() => {
@@ -114,6 +117,7 @@ export default function Settings() {
             value={String(retention)}
             onValueChange={(v) => setRetention(Number(v))}
             className="mt-5 space-y-3"
+            disabled={loading || saving}
           >
             {RETENTION_OPTIONS.map((option) => (
               <div key={option.value} className="flex items-start gap-3">

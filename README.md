@@ -50,7 +50,7 @@ Built for researchers polishing a paper, technical writers refining documentatio
 | --- | --- |
 | **Choose your voice** | Use Professional Researcher, Casual Blogger, Technical Writer, or describe a custom voice. Add context about your audience or purpose. |
 | **Keep the structure you need** | Request shorter, similar-length, or longer prose, with controls for headings and lists. |
-| **See what changed** | Read word-level markup inline or compare paragraphs side by side. Accept or reject changes by paragraph, show changed paragraphs only, or apply a choice across the document. |
+| **See what changed** | Read word-level markup inline or compare passages side by side. Accept or reject individual changes, show changed passages only, or apply a choice across the document. Structural edits can group several paragraphs into one review choice. |
 | **Inspect the audit** | Review findings about claims, numbers, names, citations, quotations, certainty, and formatting. Added or missing information stays visible. |
 | **Take your work with you** | Copy the result or download `.txt` and `.md` files. Revisit saved rewrites, audits, and editor’s notes in History. |
 | **Choose what gets saved** | Keep history for 7, 30, or 90 days, or keep a rewrite in page memory only. Delete individual rewrites or clear local history. |
@@ -96,9 +96,9 @@ flowchart LR
 3. **Rewrite in sections.** Apply your voice and formatting preferences with section-specific source facts and context from preceding sections.
 4. **Check the result separately.** Compare the full original and rewrite in another model pass, supplemented by deterministic checks. The audit does not receive the rewrite plan.
 5. **Repair, then check again.** Attempt up to two repair passes. Findings that remain produce **Needs review** rather than disappearing behind a success message.
-6. **Make the final call.** Inspect the changes, keep the paragraphs you want, and export your text.
+6. **Make the final call.** Inspect the changes, keep the passages you want, and export your text. Review choices are saved with your local history.
 
-The audit checks consistency with your source; it does not verify that the source itself is true. Automated checks can miss errors. If you accept or reject paragraphs after the audit, review that final combination again before sharing it.
+The audit checks consistency with your source; it does not verify that the source itself is true. Automated checks can miss errors. If you reject changes after the audit, review that final combination again before sharing it.
 
 ## Four voices, one draft
 
@@ -111,7 +111,7 @@ The audit checks consistency with your source; it does not verify that the sourc
 
 ## Quick start
 
-**Requirements:** Node.js **22 or 24**, npm, and a key for at least one supported AI provider.
+**Requirements:** Node.js **22 or 24**, npm, and an **OpenRouter key** for the default free-only mode.
 
 ```bash
 git clone https://github.com/ambreenprimeline-oss/toned-ai-humanizer.git
@@ -120,7 +120,7 @@ npm ci
 cp .env.example .env.local
 ```
 
-Enter a provider key in the ignored `.env.local` file, or inject it through your environment’s secure settings. For Google, `GOOGLE_API_KEY` is enough; `GOOGLE_API_KEY_1` is an optional alias. Never put credentials in a `VITE_` variable.
+Enter `OPENROUTER_API_KEY_1` in the ignored `.env.local` file, or inject it through secure environment settings. The default `AI_PROVIDER_MODE=free` uses `openrouter/free` for rewriting and audits, with no paid fallback. Never put credentials in a `VITE_` variable.
 
 ```bash
 npm run dev
@@ -128,9 +128,17 @@ npm run dev
 
 Use the address printed by Vite. The development server runs the interface and the real API handlers together. Restart it after changing environment variables.
 
-No account, database for document history, or separate backend process is needed for local development. AI requests may incur charges from your provider.
+No account, database for document history, or separate backend process is needed for local development. Free-tier availability and rate limits apply. Potentially paid models require explicit configured-mode opt-in; hosting and Redis have their own plans and limits.
 
-### Choose your AI provider
+### Free-only by default
+
+Toned defaults to OpenRouter's **`openrouter/free`** route for both model tiers. The provider catalog reports zero prompt/completion pricing for this route. Optional `OPENROUTER_FREE_MODEL` overrides must use `openrouter/free` or an ID ending in `:free`. Paid model overrides and other providers are disabled in this mode.
+
+Free does not mean unlimited: the provider can rate-limit requests or run out of capacity. Production request limits still apply.
+
+### Optional provider configuration
+
+Setting **`AI_PROVIDER_MODE=configured`** explicitly enables the following provider choices and potentially paid model routes:
 
 | Provider | Primary server credential | Additional setup |
 | --- | --- | --- |
@@ -139,7 +147,7 @@ No account, database for document history, or separate backend process is needed
 | **SambaNova** | `SAMBANOVA_API_KEY_1` | Configure model overrides if needed. |
 | **Cloudflare Workers AI** | `CLOUDFLARE_API_KEY_1` | Also requires `CLOUDFLARE_ACCOUNT_ID`. |
 
-Configure one provider or several. Optional second and third keys support rotation within a running server instance. Calls have bounded retries and can fall back to another configured provider within the attempt budget.
+In configured mode, configure one provider or several. Optional second and third keys support rotation within a running server instance. Calls have bounded retries and can fall back to another configured provider within the attempt budget.
 
 See the [provider configuration guide](ai-humanizer/README.md#provider-configuration) for model defaults, aliases, destinations, and timeouts.
 
@@ -149,7 +157,7 @@ Import this repository into Vercel and set the **Root Directory** to **`ai-human
 
 Before opening the deployment to users:
 
-1. **Add a provider credential** in Vercel’s server environment settings. Cloud development settings do not automatically configure a deployment.
+1. **Add `OPENROUTER_API_KEY_1`** in Vercel’s server environment settings and keep `AI_PROVIDER_MODE=free`, or explicitly choose configured mode and its provider credentials. Cloud development settings do not automatically configure a deployment.
 2. **Configure shared request limits** with `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` from a dedicated Upstash database. The token needs EVAL permissions. Production and preview deployments require this shared limiter.
 3. **Set a usage budget.** Defaults allow 60 stage requests per client per 10 minutes and 1,000 globally per UTC day. A document uses multiple stage requests. Review those limits and your provider’s billing controls for your expected traffic.
 4. **Run the checks**, then exercise a representative rewrite using your actual provider credentials and inspect its audit.

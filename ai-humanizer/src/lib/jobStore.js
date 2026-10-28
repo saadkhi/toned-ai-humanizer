@@ -3,6 +3,34 @@ const JOB_KEY = 'humanizer_jobs';
 const SETTING_KEY = 'humanizer_settings';
 const temporaryJobs = new Map();
 
+const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const optionalStrings = (record, fields) => fields.every((field) => record[field] == null || typeof record[field] === 'string');
+
+function validRecord(record, key) {
+  if (!isObject(record) || typeof record.id !== 'string' || !record.id) return false;
+  if (key === SETTING_KEY) return record.retention_days == null || [0, 7, 30, 90].includes(record.retention_days);
+  if (!optionalStrings(record, ['title', 'source_text', 'final_text', 'rewritten_text', 'style', 'custom_style', 'purpose', 'status', 'provider', 'model_fast', 'model_quality', 'prompt_version', 'error', 'notes'])) return false;
+  if (['source_words', 'result_words', 'cost_estimate', 'repair_loops'].some((field) => record[field] != null && (typeof record[field] !== 'number' || !Number.isFinite(record[field]) || record[field] < 0))) return false;
+  if (['expires_at', 'created_date'].some((field) => record[field] != null && (typeof record[field] !== 'string' || !Number.isFinite(Date.parse(record[field]))))) return false;
+  if (record.review_decisions != null && (!isObject(record.review_decisions) || Object.values(record.review_decisions).some((value) => typeof value !== 'boolean'))) return false;
+  if (record.unresolved_flags != null && (!Array.isArray(record.unresolved_flags) || record.unresolved_flags.some((flag) => typeof flag !== 'string' && !isObject(flag)))) return false;
+  if (record.audit != null) {
+    if (!isObject(record.audit) || !optionalStrings(record.audit, ['summary'])) return false;
+    for (const field of ['items', 'certainty', 'format_violations']) {
+      const entries = record.audit[field];
+      if (entries != null && (!Array.isArray(entries) || entries.some((entry) => !isObject(entry) || !optionalStrings(entry, ['kind', 'value', 'status', 'note', 'marker', 'rule'])))) return false;
+    }
+  }
+  if (record.diagnosis != null) {
+    if (!isObject(record.diagnosis)) return false;
+    for (const field of ['patterns', 'findings']) {
+      const findings = record.diagnosis[field];
+      if (findings != null && (!Array.isArray(findings) || findings.some((entry) => !isObject(entry) || !optionalStrings(entry, ['pattern', 'location', 'severity'])))) return false;
+    }
+  }
+  return true;
+}
+
 function readAll(key) {
   let value;
   try {
@@ -10,7 +38,9 @@ function readAll(key) {
   } catch {
     throw new Error('Saved data could not be read. Check that browser storage is available.');
   }
-  if (!Array.isArray(value)) throw new Error('Saved data is damaged. Clear this site’s browser data to reset it.');
+  if (!Array.isArray(value) || value.some((record) => !validRecord(record, key)) || new Set(value.map((record) => record.id)).size !== value.length) {
+    throw new Error('Saved data is damaged and could not be opened safely. Your data has not been changed. You can delete saved rewrites in Data & settings or clear this site’s browser data to reset it.');
+  }
   return value;
 }
 
@@ -18,7 +48,7 @@ function writeAll(key, items) {
   try {
     localStorage.setItem(key, JSON.stringify(items));
   } catch {
-    throw new Error('Your browser could not save this rewrite. Free some site storage, or choose “Do not save to history” in settings.');
+    throw new Error('Your browser could not update saved data. Free some site storage or check storage permissions, then try again.');
   }
 }
 
@@ -71,7 +101,7 @@ const RewriteJob = {
       writeAll(JOB_KEY, savedJobs().filter((job) => !job.expires_at || job.expires_at >= filter.expires_at.$lt));
     }
   },
-  async list(sortField = '-created_date', limit = 100) {
+  async list(sortField = '-created_date', limit = Infinity) {
     const desc = String(sortField).startsWith('-');
     const field = desc ? sortField.slice(1) : sortField;
     return savedJobs().sort((a, b) => {

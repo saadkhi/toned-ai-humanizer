@@ -34,11 +34,23 @@ export default function Editor() {
   const [refusal, setRefusal] = useState('');
   const [decisions, setDecisions] = useState({});
 
+  const mounted = useRef(false);
   const activeRun = useRef(null);
+  const activeJobId = useRef(null);
   const temporaryJobId = useRef(null);
+  const decisionsRef = useRef({});
+  const reviewSaveVersion = useRef(0);
+  const selectedJobId = useRef(null);
   const healthRequest = useRef(null);
   const [service, setService] = useState('checking');
   const jobId = searchParams.get('job');
+  selectedJobId.current = jobId;
+
+  const forgetTemporaryJob = () => {
+    const id = temporaryJobId.current;
+    temporaryJobId.current = null;
+    if (id) jobStore.RewriteJob.delete(id).catch(() => {});
+  };
 
   const checkService = useCallback(async () => {
     healthRequest.current?.abort();
@@ -56,11 +68,15 @@ export default function Editor() {
   }, []);
 
   useEffect(() => {
+    mounted.current = true;
     checkService();
     return () => {
+      mounted.current = false;
       healthRequest.current?.abort();
       activeRun.current?.abort();
-      if (temporaryJobId.current) jobStore.RewriteJob.delete(temporaryJobId.current).catch(() => {});
+      activeRun.current = null;
+      activeJobId.current = null;
+      forgetTemporaryJob();
     };
   }, [checkService]);
 
@@ -76,14 +92,34 @@ export default function Editor() {
 
   // Load a job from localStorage when ?job= param is present
   useEffect(() => {
-    if (!jobId) return undefined;
+    // The run already owns the freshest job state; don't replace it with a queued snapshot.
+    if (activeRun.current && activeJobId.current === jobId) return undefined;
+    activeRun.current?.abort();
+    activeRun.current = null;
+    activeJobId.current = null;
+    setRunning(false);
+    if (temporaryJobId.current && temporaryJobId.current !== jobId) forgetTemporaryJob();
+    setJob(null);
+    setError('');
+    setRefusal('');
+    decisionsRef.current = {};
+    setDecisions({});
+    reviewSaveVersion.current++;
+    if (!jobId) {
+      setLoading(false);
+      setForm(EMPTY_FORM);
+      return undefined;
+    }
     let active = true;
     setLoading(true);
     jobStore.RewriteJob.get(jobId)
       .then((record) => {
         if (active) {
           setJob(record);
-          setDecisions({});
+          const saved = Object.fromEntries(Object.entries(record.review_decisions || {})
+            .filter(([id, accepted]) => /^p\d+$/.test(id) && typeof accepted === 'boolean'));
+          decisionsRef.current = saved;
+          setDecisions(saved);
           // Reopening an interrupted job should recover its input, not an empty draft.
           // During a current run the form already contains the user's latest choices.
           if (!record.final_text && !activeRun.current) {
@@ -122,10 +158,25 @@ export default function Editor() {
 
   const update = (patch) => setForm((c) => ({ ...c, ...patch }));
 
+  const saveDecisions = async (next) => {
+    const id = job?.id;
+    decisionsRef.current = next;
+    setDecisions(next);
+    const version = ++reviewSaveVersion.current;
+    try {
+      await jobStore.RewriteJob.update(id, { review_decisions: next });
+    } catch {
+      if (mounted.current && selectedJobId.current === id && reviewSaveVersion.current === version) {
+        setError('Your review choices could not be saved. You can still copy or download the current result before leaving this page.');
+      }
+    }
+  };
+
   const handleRun = async () => {
     if (activeRun.current || service !== 'ready') return;
     setError('');
     setRefusal('');
+    decisionsRef.current = {};
     setDecisions({});
     if (!form.text.trim()) {
       setError('Paste or open a document first.');
@@ -139,12 +190,14 @@ export default function Editor() {
     }
 
     const controller = new AbortController();
+    const isCurrentRun = () => mounted.current && activeRun.current === controller;
     activeRun.current = controller;
     setRunning(true);
     setStage('extract');
     setProgress(0);
     let created = null;
     try {
+      forgetTemporaryJob();
       created = await createJob({
         text: form.text,
         style: form.style,
@@ -154,14 +207,23 @@ export default function Editor() {
         retentionDays: retention,
         filename: form.filename,
       });
+      if (!isCurrentRun()) {
+        if (retention === 0) await jobStore.RewriteJob.delete(created.id);
+        return;
+      }
+      activeJobId.current = created.id;
       if (retention === 0) temporaryJobId.current = created.id;
       setJob(created);
       setSearchParams({ job: created.id }, { replace: true });
 
       const result = await runPipeline(created.id, ({ stage: s, progress: p }) => {
-        setStage(s);
-        setProgress(p);
+        if (isCurrentRun()) {
+          setStage(s);
+          setProgress(p);
+        }
       }, { signal: controller.signal });
+
+      if (!isCurrentRun()) return;
 
       if (result.refused) {
         setRefusal(result.reason);
@@ -169,39 +231,34 @@ export default function Editor() {
         return;
       }
 
-      if (retention === 0) {
-        const finished = result.job;
-        await jobStore.RewriteJob.delete(created.id);
-        temporaryJobId.current = null;
-        setSearchParams({}, { replace: true });
-        setJob({ ...finished, id: created.id, retention_days: 0 });
-      } else {
-        setJob(result.job || (await jobStore.RewriteJob.get(created.id)));
-      }
+      // Temporary jobs stay only in the memory store until this view is left.
+      // Keeping their selection avoids clearing a completed result during navigation.
+      setJob(result.job || (await jobStore.RewriteJob.get(created.id)));
     } catch (runError) {
       const message = runError.message || 'The rewrite failed.';
-      setError(message);
+      if (isCurrentRun()) setError(message);
       if (created) {
         try {
-          await jobStore.RewriteJob.update(created.id, { status: 'failed', error: message });
-          setJob(await jobStore.RewriteJob.get(created.id));
+          const failed = await jobStore.RewriteJob.update(created.id, { status: 'failed', error: message });
+          if (isCurrentRun()) setJob(failed);
         } catch {
-          setJob(null);
+          if (isCurrentRun()) setJob(null);
         }
       }
     } finally {
-      activeRun.current = null;
-      setRunning(false);
+      if (isCurrentRun()) {
+        activeRun.current = null;
+        activeJobId.current = null;
+        setRunning(false);
+      }
     }
   };
 
   const handleNew = () => {
-    if (temporaryJobId.current) {
-      jobStore.RewriteJob.delete(temporaryJobId.current).catch(() => {});
-      temporaryJobId.current = null;
-    }
+    forgetTemporaryJob();
     setForm(EMPTY_FORM);
     setJob(null);
+    decisionsRef.current = {};
     setDecisions({});
     setError('');
     setRefusal('');
@@ -266,14 +323,8 @@ export default function Editor() {
           job={job}
           review={review}
           decisions={decisions}
-          onToggle={(id) =>
-            setDecisions((c) => ({ ...c, [id]: c[id] === false ? true : false }))
-          }
-          onAll={(accept) =>
-            setDecisions(
-              accept ? {} : Object.fromEntries(review.changes.map((ch) => [ch.id, false])),
-            )
-          }
+          onToggle={(id) => saveDecisions({ ...decisionsRef.current, [id]: decisionsRef.current[id] === false ? true : false })}
+          onAll={(accept) => saveDecisions(accept ? {} : Object.fromEntries(review.changes.map((ch) => [ch.id, false])))}
           text={text}
           onNew={handleNew}
         />

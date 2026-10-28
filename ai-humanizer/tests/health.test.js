@@ -3,15 +3,9 @@ import assert from 'node:assert/strict';
 import health from '../api/health.js';
 
 function setup(t, values = {}) {
-  const names = [...Object.keys(process.env).filter(name => /^(GOOGLE|OPENROUTER|SAMBANOVA|CLOUDFLARE)_API_KEY/.test(name)), 'GOOGLE_API_KEY_1', 'NODE_ENV', 'VERCEL', 'VERCEL_ENV', 'UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN'];
-  const before = Object.fromEntries(names.map(name => [name, process.env[name]]));
-  for (const name of names) delete process.env[name];
-  Object.assign(process.env, { NODE_ENV: 'test' }, values);
-  t.after(() => {
-    for (const [name, value] of Object.entries(before)) {
-      if (value === undefined) delete process.env[name]; else process.env[name] = value;
-    }
-  });
+  const before = process.env;
+  process.env = { NODE_ENV: 'test', AI_PROVIDER_MODE: 'configured', ...values };
+  t.after(() => { process.env = before; });
 }
 function call(method = 'GET') {
   const res = { headers: {}, statusCode: 200, setHeader(name, value) { this.headers[name] = value; }, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } };
@@ -31,6 +25,7 @@ test('health exposes provider names but no credentials or models', t => {
   setup(t, { GOOGLE_API_KEY_1: 'synthetic-test-secret' });
   const res = call();
   assert.equal(res.statusCode, 200);
+  assert.equal(res.body.mode, 'configured');
   assert.deepEqual(res.body.providers, ['google']);
   assert.ok(!JSON.stringify(res.body).includes('synthetic-test-secret'));
 });
@@ -58,4 +53,23 @@ test('partial local Redis settings cannot report ready when stage guards will re
   const res = call();
   assert.equal(res.statusCode, 503);
   assert.equal(res.body.protectionConfigured, false);
+});
+
+test('health reports default free mode without selecting configured paid providers', t => {
+  setup(t, { OPENROUTER_API_KEY: 'synthetic-free-health', GOOGLE_API_KEY: 'synthetic-paid-health' });
+  delete process.env.AI_PROVIDER_MODE;
+  const res = call();
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.mode, 'free');
+  assert.deepEqual(res.body.providers, ['openrouter']);
+  assert.doesNotMatch(JSON.stringify(res.body), /synthetic-|openrouter\/free/);
+});
+
+test('health is unavailable for a paid free-model override with no paid-provider fallback', t => {
+  setup(t, { AI_PROVIDER_MODE: 'free', OPENROUTER_API_KEY: 'synthetic-invalid-free', GOOGLE_API_KEY: 'synthetic-paid-fallback', OPENROUTER_FREE_MODEL: 'google/gemini-2.5-pro' });
+  const res = call();
+  assert.equal(res.statusCode, 503);
+  assert.equal(res.body.mode, 'free');
+  assert.equal(res.body.providerConfigured, false);
+  assert.deepEqual(res.body.providers, []);
 });
