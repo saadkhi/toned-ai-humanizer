@@ -22,7 +22,7 @@ try {
   const connection = neonDatabaseUrl();
   const config = getSecurityConfig();
   if (!connection || config.store !== 'neon' || !config.durableConfigured) {
-    emit(stage, { pass: false, neonUrlPresent: !!(process.env.NEON_DATABASE_URL || process.env.DATABASE_URL), selectedStore: config.store, neonUrlValid: !!connection });
+    emit(stage, { pass: false, neonUrlPresent: !!(process.env.NEON_DATABASE_URL || process.env.DATABASE_URL), selectedStore: config.store, neonUrlValid: !!connection, issue: config.protectionIssue });
     process.exitCode = 1;
   } else {
     emit(stage, { pass: true, store: config.store });

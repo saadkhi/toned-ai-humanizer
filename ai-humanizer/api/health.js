@@ -12,12 +12,15 @@ export default function health(req, res) {
   const security = getSecurityConfig();
   const protectionConfigured = !security.requiresDurable || security.durableConfigured;
   const configured = provider.configured && protectionConfigured;
+  const revision = process.env.VERCEL_GIT_COMMIT_SHA;
   return res.status(configured ? 200 : 503).json({
     mode: provider.mode,
     configured,
     providerConfigured: provider.configured,
     protectionConfigured,
     protectionStore: security.store,
+    protectionIssue: security.protectionIssue,
+    deploymentRevision: typeof revision === 'string' && /^[a-f\d]{7,40}$/i.test(revision) ? revision.slice(0, 12) : null,
     providers: provider.providers,
   });
 }

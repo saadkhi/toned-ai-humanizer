@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
-import { neonDatabaseUrl, neonLimit } from './_neon.js';
+import { neonConfigurationIssue, neonDatabaseUrl, neonLimit } from './_neon.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const localCounters = new Map();
@@ -38,11 +38,17 @@ export function getSecurityConfig(env = process.env) {
   const durableConfigured = store === 'upstash'
     ? Boolean(redisUrl(env.UPSTASH_REDIS_REST_URL?.trim()) && env.UPSTASH_REDIS_REST_TOKEN?.trim())
     : store === 'neon' && Boolean(neonDatabaseUrl(env));
+  const requiresDurable = production || requestedStore !== 'auto' || hasRedis || hasNeon;
+  const protectionIssue = !requiresDurable || durableConfigured ? null
+    : store === 'neon' ? neonConfigurationIssue(env)
+      : store === 'upstash' ? 'upstash_not_configured'
+        : store === null ? 'rate_limit_store_invalid' : 'rate_limit_store_missing';
   return {
     production,
     store,
-    requiresDurable: production || requestedStore !== 'auto' || hasRedis || hasNeon,
+    requiresDurable,
     durableConfigured,
+    protectionIssue,
     rateLimit: boundedInteger(env.RATE_LIMIT_REQUESTS, 60, 1, 300),
     windowSeconds: boundedInteger(env.RATE_LIMIT_WINDOW_SECONDS, 600, 60, 3600),
     dailyLimit: boundedInteger(env.DAILY_STAGE_LIMIT, 1000, 1, 100000),
@@ -193,7 +199,21 @@ export async function guardApiRequest(req, res, {
           : 'Too many rewrite requests. Please wait before trying again.', result[1]);
     }
     return true;
-  } catch {
+  } catch (error) {
+    // Whitelist SQLSTATE classifications, never upstream messages, connection
+    // strings, database names, or credentials. This helps site setup without
+    // exposing the database response or falling back to weaker limits.
+    if (config.store === 'neon') {
+      if (['42P01', '42883'].includes(error?.code)) {
+        return reply(res, 503, 'rate_limit_schema_missing', 'The site’s database setup is incomplete. Please contact the site owner.');
+      }
+      if (error?.code === '28P01') {
+        return reply(res, 503, 'rate_limit_database_auth_failed', 'The site’s database credentials need updating. Please contact the site owner.');
+      }
+      if (error?.code === '42501') {
+        return reply(res, 503, 'rate_limit_database_permission_denied', 'The site’s database permissions need updating. Please contact the site owner.');
+      }
+    }
     return reply(res, 503, 'rate_limit_unavailable', 'Rewriting is temporarily unavailable. Please try again later.');
   }
 }

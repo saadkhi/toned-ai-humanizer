@@ -177,6 +177,6 @@ test('local global budget applies across client addresses', async () => {
 
 test('limits accept bounded integers and reject invalid or unlimited overrides', () => {
   const config = getSecurityConfig({ RATE_LIMIT_REQUESTS: '-1', RATE_LIMIT_WINDOW_SECONDS: '1', DAILY_STAGE_LIMIT: '0' });
-  assert.deepEqual(config, { production: false, store: 'memory', requiresDurable: false, durableConfigured: false, rateLimit: 60, windowSeconds: 600, dailyLimit: 1000 });
+  assert.deepEqual(config, { production: false, store: 'memory', requiresDurable: false, durableConfigured: false, protectionIssue: null, rateLimit: 60, windowSeconds: 600, dailyLimit: 1000 });
   assert.equal(getSecurityConfig({ RATE_LIMIT_REQUESTS: '300' }).rateLimit, 300);
 });

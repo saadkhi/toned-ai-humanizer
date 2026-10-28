@@ -102,3 +102,37 @@ test('invalid Neon production bindings cannot report protection ready', t => {
   assert.equal(res.body.protectionConfigured, false);
   assert.equal(res.body.protectionStore, 'neon');
 });
+
+test('Neon configuration diagnostics distinguish a missing value from rejected values without contacting the database', t => {
+  setup(t, {
+    NODE_ENV: 'production', OPENROUTER_API_KEY: 'synthetic-model-key', RATE_LIMIT_STORE: 'neon',
+    VERCEL_GIT_COMMIT_SHA: 'abcdef1234567890abcdef1234567890abcdef12',
+  });
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = () => assert.fail('Configuration diagnostics must not contact upstream services');
+  t.after(() => { globalThis.fetch = previousFetch; });
+  const url = 'postgresql://synthetic_user:synthetic_password@ep-health.c-6.us-east-2.aws.neon.tech/neondb?sslmode=require';
+  for (const [value, issue] of [
+    [undefined, 'neon_url_missing'], ['invalid-private-configuration', 'neon_url_invalid'],
+    [url.replace('require', 'disable'), 'neon_url_requires_tls'],
+    [url + '&unsupported=private-value', 'neon_url_unsupported_parameters'],
+  ]) {
+    if (value === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = value;
+    const res = call();
+    assert.equal(res.statusCode, 503);
+    assert.equal(res.body.protectionIssue, issue);
+    assert.equal(res.body.deploymentRevision, 'abcdef123456');
+    assert.doesNotMatch(JSON.stringify(res.body), /synthetic_|private-value|postgresql:|invalid-private/);
+  }
+  process.env.DATABASE_URL = url;
+  assert.equal(call().body.protectionIssue, null);
+  assert.equal(call().statusCode, 200);
+});
+
+test('health never echoes a non-SHA deployment revision', t => {
+  setup(t, { VERCEL_GIT_COMMIT_SHA: 'private-invalid-revision-value' });
+  const res = call();
+  assert.equal(res.body.deploymentRevision, null);
+  assert.doesNotMatch(JSON.stringify(res.body), /private-invalid/);
+});

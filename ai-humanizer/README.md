@@ -81,16 +81,16 @@ Neon can provide the shared request-limit store without an Upstash account. Its 
 
 1. Open [Neon Console](https://console.neon.tech/), create a project on the **Free** plan, and select the database and branch you will use for production.
 2. Open that database's **SQL Editor** and run the complete [db/neon-rate-limits.sql](db/neon-rate-limits.sql) migration once. Use the same database/branch and role as the connection string. The migration creates the counters and atomic limiter function and can be rerun safely.
-3. Open **Connect** and copy the PostgreSQL connection string. Keep its password private. The URL must use the project's `*.neon.tech` hostname and `sslmode=require` or `sslmode=verify-full`; pooled Neon connection strings are supported. An optional `channel_binding=require` or `prefer` parameter is accepted; other connection query parameters are rejected.
+3. Open **Connect** and copy the PostgreSQL URI starting with `postgresql://` or `postgres://`. Keep its password private. When Neon displays `psql 'postgresql://…'`, the URI inside the quotes is the environment value. The server also accepts a simple pasted `psql 'URI'`, quoted URI, or `DATABASE_URL=URI` assignment as data; it never executes that text. The URL must use the project's `*.neon.tech` hostname and `sslmode=require` or `sslmode=verify-full`; pooled Neon connection strings are supported. An optional `channel_binding=require` or `prefer` parameter is accepted; other connection query parameters are rejected.
 4. In **Vercel → Project → Settings → Environment Variables**, add these values for **Production**:
 
 | Variable | Value |
 | --- | --- |
 | `RATE_LIMIT_STORE` | `neon` |
-| `DATABASE_URL` | The full PostgreSQL connection string copied from Neon |
+| `NEON_DATABASE_URL` | The full PostgreSQL connection string copied from Neon |
 | `AI_PROVIDER_MODE` | `free` to keep free-only model routing |
 
-`NEON_DATABASE_URL` is an alternative to `DATABASE_URL`; use one connection variable consistently. A Neon API key, dashboard URL, or database name alone is not a connection string. The Neon connection is used for counters only, so it does not create accounts or synchronize document history.
+`NEON_DATABASE_URL` is the preferred app variable and takes precedence when both names are set. `DATABASE_URL` remains a supported fallback for Neon CLI compatibility; use one current connection binding consistently. A Neon API key, dashboard URL, or database name alone is not a connection string. The Neon connection is used for counters only, so it does not create accounts or synchronize document history.
 
 Add Preview scope too if preview deployments should rewrite. Save the variables, then choose **Deployments → latest production deployment → Redeploy**. Setting `RATE_LIMIT_STORE=neon` explicitly selects Neon even if old Upstash variables remain. Upstash credentials are not required for this option.
 
@@ -133,6 +133,27 @@ With `RATE_LIMIT_STORE=auto` (the default), any supplied Upstash REST variable s
 ### Rewriting is unavailable after deployment
 
 Inspect the deployed `/api/health` response. When it reports `providerConfigured: true` and `protectionConfigured: false`, the model provider has configuration but production request limiting does not. Waiting or adding another model key will not resolve this setup issue.
+
+With `protectionStore: "neon"`, a false protection status means the running deployment has a missing or rejected connection value; it has not attempted a database connection yet. The `protectionIssue` field identifies the validation failure without returning credentials:
+
+| Issue | Adjustment |
+| --- | --- |
+| `neon_url_missing` | Set `NEON_DATABASE_URL` in Production, then redeploy. Saved project variables are separate from those captured by an existing deployment. |
+| `neon_url_invalid` | Copy the complete PostgreSQL URI from Neon Connect. Verify its username, password, database path, and Neon hostname locally; keep the value private. |
+| `neon_url_requires_tls` | Use exactly one `sslmode=require` or `sslmode=verify-full` query parameter. |
+| `neon_url_unsupported_parameters` | Use the standard Neon URI with `sslmode` and optional `channel_binding=require`/`prefer`. Remove other connection query options. |
+
+If `NEON_DATABASE_URL` exists, it takes precedence over `DATABASE_URL`; keep one current connection binding. `deploymentRevision` reports the running Git commit prefix when Vercel supplies it, so you can verify that a new deployment includes a fix. Neither field establishes database connectivity or schema readiness.
+
+If health is configured but a rewrite fails, the API distinguishes these database setup errors without exposing upstream messages:
+
+| Stage error code | Adjustment |
+| --- | --- |
+| `rate_limit_schema_missing` | Run the complete `db/neon-rate-limits.sql` migration in the database/branch used by `NEON_DATABASE_URL` (or its CLI-compatible fallback). |
+| `rate_limit_database_auth_failed` | Refresh the connection string from Neon Connect for the intended database role, then redeploy. |
+| `rate_limit_database_permission_denied` | Run the migration with the same role as the app connection, or grant that role the scoped table/function permissions listed in the SQL file. |
+
+Temporary networking, compute capacity, and other unclassified database failures retain `rate_limit_unavailable`; they never bypass shared limits.
 
 Follow either the [Neon](#neon-postgres-setup) or [Upstash](#upstash-redis-setup) setup above. Enter database credentials securely in Vercel; they are separate from Codex cloud environment bindings. Add Preview scope too if preview deployments should rewrite. **Redeploy after saving:** changing variables does not update an already-built deployment.
 

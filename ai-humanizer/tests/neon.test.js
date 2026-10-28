@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { neonDatabaseUrl } from '../api/_neon.js';
+import { neonDatabaseUrl, neonConfigurationIssue } from '../api/_neon.js';
 import { getSecurityConfig, guardApiRequest } from '../api/_security.js';
 
 const databaseUrl = 'postgresql://synthetic_user:synthetic_password@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require';
@@ -49,6 +49,58 @@ test('Neon URL aliases require a credentialed Neon PostgreSQL TLS connection', (
     databaseUrl + '&database=other', databaseUrl + '&connectionString=synthetic_override',
     databaseUrl + '&channel_binding=disable', databaseUrl + '&channel_binding=require&channel_binding=prefer',
   ]) assert.equal(neonDatabaseUrl({ DATABASE_URL: value }), null);
+});
+
+test('Neon clipboard formats normalize to one validated URI without losing query parameters', () => {
+  const uri = `${databaseUrl}&channel_binding=require`;
+  for (const value of [
+    uri, ` ${uri} `, `\n${uri}\r\n`, `'${uri}'`, `"${uri}"`,
+    `DATABASE_URL=${uri}`, `DATABASE_URL='${uri}'`, `NEON_DATABASE_URL="${uri}"`,
+    `psql ${uri}`, `psql '${uri}'`, `psql "${uri}"`,
+    `DATABASE_URL="psql '${uri}'"`,
+  ]) {
+    assert.equal(neonDatabaseUrl({ DATABASE_URL: value }), uri);
+    assert.equal(neonConfigurationIssue({ DATABASE_URL: value }), null);
+  }
+});
+
+test('Neon normalization rejects shell arguments, extra commands, and multiline input', () => {
+  for (const value of [
+    `psql '${databaseUrl}' --command='SELECT 1'`,
+    `psql --dbname '${databaseUrl}'`, `psql '${databaseUrl}' && echo private`,
+    `psql '${databaseUrl}';echo-private`, `psql ${databaseUrl};echo-private`,
+    `psql '${databaseUrl}' | cat`, `psql '${databaseUrl}' > private.txt`,
+    `psql ${databaseUrl}&`, `psql $(echo '${databaseUrl}')`,
+    `psql \`${databaseUrl}\``, `psql '${databaseUrl}'\necho private`,
+    `DATABASE_URL='${databaseUrl}'\nOTHER=private`,
+    `"${databaseUrl}'`, `'${databaseUrl}"`, `OTHER=${databaseUrl}`,
+    `export DATABASE_URL=${databaseUrl}`,
+  ]) {
+    assert.equal(neonDatabaseUrl({ DATABASE_URL: value }), null);
+    assert.equal(neonConfigurationIssue({ DATABASE_URL: value }), 'neon_url_invalid');
+  }
+});
+
+test('Neon setup issues identify format and TLS failures without returning credentials', () => {
+  const cases = [
+    [{}, 'neon_url_missing'], [{ DATABASE_URL: ' ' }, 'neon_url_missing'],
+    [{ DATABASE_URL: 42 }, 'neon_url_invalid'],
+    [{ DATABASE_URL: `psql '${databaseUrl.replace('.neon.tech', '.evil.example')}'` }, 'neon_url_invalid'],
+    [{ DATABASE_URL: `'${databaseUrl.replace('sslmode=require', 'sslmode=disable')}'` }, 'neon_url_requires_tls'],
+    [{ DATABASE_URL: `DATABASE_URL="${databaseUrl.replace('?sslmode=require', '')}"` }, 'neon_url_requires_tls'],
+    [{ DATABASE_URL: `psql '${databaseUrl}&sslmode=disable'` }, 'neon_url_requires_tls'],
+    [{ DATABASE_URL: `psql '${databaseUrl}&application_name=private'` }, 'neon_url_unsupported_parameters'],
+    [{ DATABASE_URL: `psql '${databaseUrl}&channel_binding=disable'` }, 'neon_url_unsupported_parameters'],
+    [{ DATABASE_URL: databaseUrl, NEON_DATABASE_URL: 'private-invalid-primary' }, 'neon_url_invalid'],
+  ];
+  for (const [env, expected] of cases) {
+    const issue = neonConfigurationIssue(env);
+    assert.equal(issue, expected);
+    assert.equal(neonDatabaseUrl(env), null);
+    assert.ok(!issue.includes('synthetic_password'));
+    assert.ok(!issue.includes('private'));
+    assert.ok(!issue.includes('postgresql'));
+  }
 });
 
 test('Neon selection is explicit or automatic without bypassing partial Redis bindings', () => {
@@ -113,6 +165,28 @@ test('the actual Neon SDK parameterizes one atomic counter call without text, ra
   assert.equal(calls, 1);
 });
 
+test('the actual Neon SDK receives the validated URI from a copied psql connection command', async (t) => {
+  let calls = 0;
+  const uri = `${databaseUrl.replace('ep-example.us-east-2', 'ep-example-pooler.c-6.us-east-2')}&channel_binding=require`;
+  mockFetch(t, async (url, options) => {
+    calls++;
+    assert.equal(String(url), 'https://api.c-6.us-east-2.aws.neon.tech/sql');
+    assert.equal(options.redirect, 'error');
+    const connection = new URL(options.headers['Neon-Connection-String']);
+    assert.equal(connection.hostname, 'ep-example-pooler.c-6.us-east-2.aws.neon.tech');
+    assert.equal(connection.password, 'synthetic_password');
+    assert.equal(connection.searchParams.get('sslmode'), 'require');
+    assert.equal(connection.searchParams.get('channel_binding'), 'require');
+    assert.ok(!options.headers['Neon-Connection-String'].startsWith('psql'));
+    return pgResult('{1,0,0}');
+  });
+  const res = response();
+  assert.equal(await guardApiRequest(request(), res, {
+    billable: true, env: { ...production, DATABASE_URL: `psql '${uri}'` },
+  }), true);
+  assert.equal(calls, 1);
+});
+
 for (const [reason, code] of [[1, 'rate_limit_reached'], [2, 'daily_limit_reached']]) {
   test(`Neon ${code} preserves Retry-After without falling back to another store`, async (t) => {
     mockFetch(t, async () => pgResult(`{0,123,${reason}}`));
@@ -131,8 +205,7 @@ test('Neon transport, missing-schema, and malformed results fail closed without 
   for (const impl of [
     async () => { throw new Error(privateMessage); },
     async () => new Response(privateMessage, { status: 500 }),
-    async () => Response.json({ message: privateMessage, code: '42883' }, { status: 400 }),
-    async () => Response.json({ message: privateMessage, code: '42P01' }, { status: 400 }),
+    async () => Response.json({ message: privateMessage, code: '08006' }, { status: 400 }),
     async () => new Response('unreadable-json'),
     async () => Response.json({ fields: [{ name: 'result', dataTypeID: 1007 }], rows: [] }),
     async () => pgResult('{0,-1,2}'), async () => pgResult('{0,86401,2}'),
@@ -149,5 +222,22 @@ test('Neon transport, missing-schema, and malformed results fail closed without 
     assert.ok(!JSON.stringify(res.data).includes('synthetic_password'));
     assert.ok(!JSON.stringify(res.data).includes('private-db-error'));
     assert.equal(calls, 1);
+  }
+});
+
+test('Neon setup errors have safe actionable codes without returning SQL details or credentials', async (t) => {
+  const previous = globalThis.fetch;
+  t.after(() => { globalThis.fetch = previous; });
+  for (const [sqlState, code] of [
+    ['42883', 'rate_limit_schema_missing'], ['42P01', 'rate_limit_schema_missing'],
+    ['28P01', 'rate_limit_database_auth_failed'], ['42501', 'rate_limit_database_permission_denied'],
+  ]) {
+    globalThis.fetch = async () => Response.json({ message: 'private-db-details synthetic_password', code: sqlState }, { status: 400 });
+    const res = response();
+    assert.equal(await guardApiRequest(request(), res, { billable: true, env: production, fetchImpl: () => assert.fail('Neon errors must not fall back to Redis') }), false);
+    assert.equal(res.statusCode, 503);
+    assert.equal(res.data.code, code);
+    assert.match(res.data.error, /site owner/);
+    assert.doesNotMatch(JSON.stringify(res.data), /private-db-details|synthetic_password|postgresql:/);
   }
 });

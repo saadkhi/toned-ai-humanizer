@@ -71,3 +71,15 @@ No live Neon connection string was injected into this environment during those c
 Validation completed: `npm run build` passed, `npm run check` passed lint, 146 tests, and build, the full Chromium suite passed 29 tests, and the dependency audit reported zero vulnerabilities. The app started; its root returned HTTP 200. Health returned HTTP 503 with `protectionStore: "neon"`, `providerConfigured: true`, and `protectionConfigured: false`. A synthetic stage request returned HTTP 503 `rate_limit_unavailable` without calling a model.
 
 The new `npm run db:check` command correctly exited 1 with `neonUrlPresent: false`; it did not claim a working database. Deployment, environment download, schema application, real Neon access, and a real Neon-backed rewrite remain blocked pending network access and CLI authentication. No end-to-end Neon success is claimed. See [the CLI workflow](../ai-humanizer/README.md#neon-cli-workflow).
+
+## Live configuration recheck · 28 October 2026
+
+After the owner's Vercel environment updates, fresh public health requests returned HTTP503 with `mode: "free"`, `providerConfigured: true`, `protectionStore: "neon"`, and `protectionConfigured: false`. A public synthetic rewrite returned HTTP503 `rate_limit_unavailable`. Chromium reproduced the disabled editor banner with no page errors. These are current deployed responses, not mocked fixtures.
+
+This combination isolates the active failure to a missing or rejected Neon connection value before any database query. It does not establish an invalid database password, missing SQL migration, or AI-provider failure. The supplied screenshots show variable names/scopes but hide their values, so the exact rejected value cannot be determined from them.
+
+The existing validator rejected Neon's copied `psql 'postgresql://…'` clipboard form even when the enclosed URI was valid. The parser now accepts a simple psql wrapper, matching quotes, or a connection-variable assignment as data before applying the existing destination/TLS checks. It never executes pasted command text and rejects extra flags/commands. Health now reports a secret-free `protectionIssue` and a sanitized deployed Git revision. SQL schema/authentication/permission failures have separate safe stage codes to make subsequent setup failures identifiable.
+
+Deployment adjustments: use the full raw PostgreSQL URI in Vercel's `DATABASE_URL`, keep `RATE_LIMIT_STORE=neon` and `AI_PROVIDER_MODE=free`, check for an outdated higher-priority `NEON_DATABASE_URL`, and redeploy after saving. Run the supplied SQL migration in the same database/branch before testing a real rewrite. See [the troubleshooting guide](../ai-humanizer/README.md#rewriting-is-unavailable-after-deployment).
+
+After these fixes, lint, all 153 unit/integration tests, the production build, and all 29 Chromium tests passed. The current live deployment still needs to serve the new revision before its new diagnostics and normalization can be evaluated remotely.

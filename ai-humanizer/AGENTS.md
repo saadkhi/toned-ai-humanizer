@@ -11,7 +11,7 @@ Read README.md before changing the application. This repository is a React/Vite 
 
 Run `npm ci`, then `npm run dev` from this directory. Keep API keys in server environment variables or ignored `.env.local`; never use a `VITE_` credential or expose provider responses containing secrets. Do not log document bodies.
 
-Use `RATE_LIMIT_STORE=neon` with `DATABASE_URL` (or `NEON_DATABASE_URL`) for Neon, or `RATE_LIMIT_STORE=upstash` with both Upstash REST variables. Neon requires its schema migration before live stage requests. Auto selection prioritizes any supplied Upstash binding, then Neon; partial or invalid configured stores fail closed. Never bypass production limits or treat a green configuration-only health response as proof of database connectivity, installed schema, or provider access.
+Use `RATE_LIMIT_STORE=neon` with `NEON_DATABASE_URL` for Neon; `DATABASE_URL` is a supported fallback for Neon CLI compatibility. If both are set, `NEON_DATABASE_URL` takes precedence. Use `RATE_LIMIT_STORE=upstash` with both Upstash REST variables for Redis. Neon requires its schema migration before live stage requests. Auto selection prioritizes any supplied Upstash binding, then Neon; partial or invalid configured stores fail closed. Never bypass production limits or treat a green configuration-only health response as proof of database connectivity, installed schema, or provider access.
 
 Use the existing checkout. Cloud tasks are already isolated; do not create a Git worktree unless the user requests it.
 
