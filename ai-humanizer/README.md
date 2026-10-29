@@ -40,17 +40,17 @@ Each provider supports `_KEY_2` and `_KEY_3` for rotation and a singular `*_API_
 
 `GOOGLE_API_KEY_1` is not required when `GOOGLE_API_KEY` is set. Key rotation continues across requests within each running server instance; a new instance starts its own rotation. Changing the configured key set resets that provider's pool.
 
-In configured mode, provider calls use Google → OpenRouter → SambaNova → Cloudflare for both structured and prose stages, skipping unconfigured providers. In both modes, calls allow **four minutes per attempt**, up to four attempts, and **four minutes thirty seconds total per stage**, shared across all retries. A slow first attempt leaves only the remaining stage budget for fallback; retries do not multiply the total wait.
+In configured mode, provider calls use Google → OpenRouter → SambaNova → Cloudflare for both structured and prose stages, skipping unconfigured providers. In both modes, calls allow **four minutes thirty seconds per attempt**, up to four attempts, and **four minutes forty seconds total per stage**, shared across all retries. A slow first attempt leaves only the remaining stage budget for fallback; retries do not multiply the total wait.
 
 | Server setting | Default | Maximum |
 | --- | --- | --- |
-| `LLM_REQUEST_TIMEOUT_MS` | `240000` (4 minutes per attempt) | `270000` |
-| `LLM_TOTAL_TIMEOUT_MS` | `270000` (4 minutes 30 seconds across attempts) | `270000` |
+| `LLM_REQUEST_TIMEOUT_MS` | `270000` (4 minutes 30 seconds per attempt) | `280000` |
+| `LLM_TOTAL_TIMEOUT_MS` | `280000` (4 minutes 40 seconds across attempts) | `280000` |
 | `LLM_MAX_ATTEMPTS` | `4` | `4` |
 
-The browser and live-test transport wait 310 seconds for each API response. Vercel's stage function is configured for 300 seconds; the shorter model budget leaves time for request protection, validation, and response handling. Keep Fluid compute enabled for that function duration on Vercel Hobby. Timeouts cannot be unlimited on this host. Long documents still use sequential sections, each with a fresh stage budget, so the whole rewrite may take longer than five minutes. Stop/cancel controls remain available.
+The browser and live-test transport wait 310 seconds for each API response. Vercel's stage function is configured for 300 seconds; the model budget reserves up to 15 seconds for request protection and 5 seconds for validation and response handling. This is close to the hosting ceiling. Keep Fluid compute enabled for that function duration on Vercel Hobby. Timeouts cannot be unlimited on this host. Long documents still use sequential sections, each with a fresh stage budget, so the whole rewrite may take longer than five minutes. Stop/cancel controls remain available.
 
-If Vercel already defines the old timeout overrides, **remove them to use the new defaults**, or set `LLM_REQUEST_TIMEOUT_MS=240000` and `LLM_TOTAL_TIMEOUT_MS=270000`, then redeploy. Blank overrides also use defaults. Lower explicit overrides remain supported; an explicit lower attempt limit may skip later providers. Retries may incur additional provider charges. Stopping a rewrite prevents subsequent browser requests; an already-running model call may still finish and incur a charge.
+If Vercel already defines the old timeout overrides, **remove them to use the new defaults**, or set `LLM_REQUEST_TIMEOUT_MS=270000` and `LLM_TOTAL_TIMEOUT_MS=280000`, then deploy the latest `main`. Redeploying an older commit does not include the new code or higher configuration ceilings. Verify `/api/health` reports the new deployment revision. Blank overrides also use defaults. Lower explicit overrides remain supported; an explicit lower attempt limit may skip later providers. Retries may incur additional provider charges. Stopping a rewrite prevents subsequent browser requests; an already-running model call may still finish and incur a charge.
 
 Never prefix a secret with `VITE_`: those variables are intended for browser bundles. Cloud environment settings and Vercel project environment variables are separate; configure the target where you run the application.
 
@@ -58,7 +58,7 @@ Never prefix a secret with `VITE_`: those variables are intended for browser bun
 
 The browser drives individually bounded server requests: extraction → diagnosis → sequential section rewrites → lossless assembly → independent audit → up to two repairs and re-audits → finalization.
 
-- Structured model results are validated before advancing a stage. Invalid JSON, schema failures, missing extracted facts, and incomplete audit coverage trigger a fresh model attempt within the same four-attempt/270-second budget. Validation stays strict; exhausting that budget returns an error. Usage includes completed responses rejected by validation.
+- Structured model results are validated before advancing a stage. Invalid JSON, schema failures, missing extracted facts, and incomplete audit coverage trigger a fresh model attempt within the same four-attempt/280-second budget. Validation stays strict; exhausting that budget returns an error. Usage includes completed responses rejected by validation.
 - The short diagnosis stage requests OpenRouter's `reasoning.effort=minimal`, leaving more of its output allowance for the required JSON when the free router selects a reasoning model. Extraction and auditing retain their existing reasoning behavior. Provider limits or truncation can still cause a visible failure.
 - Source/settings fingerprints invalidate stale pipeline state.
 - Long paragraphs are split into bounded sections; assembly requires all sections.

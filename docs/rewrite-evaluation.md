@@ -2,7 +2,7 @@
 
 The production application did **not** pass the full sample test. The test suite is reproducible and fails visibly when the provider does not produce a complete, audited result. No AI-detector score or human-authorship claim is made.
 
-Subsequent timeout update: the runs below used the earlier time limits. Current defaults allow 240 seconds per model attempt and 270 seconds total per stage; browser/API test transport waits 310 seconds. The manual full-pipeline test now allows 60 minutes. See the [current timeout settings](../ai-humanizer/README.md#provider-configuration). This change does not turn the recorded failures into passing live evaluations.
+Subsequent timeout update: the runs below used the earlier time limits. Current defaults allow 270 seconds per model attempt and 280 seconds total per stage; browser/API test transport waits 310 seconds. The manual full-pipeline test now allows 60 minutes. See the [current timeout settings](../ai-humanizer/README.md#provider-configuration). This change does not turn the recorded failures into passing live evaluations.
 
 ## Sample and acceptance checks
 

@@ -507,9 +507,9 @@ test('transport deadline covers reading a stalled response body', async () => {
 });
 
 test('retry budgets are bounded even for invalid or excessive environment overrides', () => {
-  assert.deepEqual(requestLimits({}), { timeout: 240000, total: 270000, attempts: 4 });
-  assert.deepEqual(requestLimits({ LLM_REQUEST_TIMEOUT_MS: '99999999', LLM_TOTAL_TIMEOUT_MS: '99999999', LLM_MAX_ATTEMPTS: '99999' }), { timeout: 270000, total: 270000, attempts: 4 });
-  assert.deepEqual(requestLimits({ LLM_REQUEST_TIMEOUT_MS: '', LLM_TOTAL_TIMEOUT_MS: ' ', LLM_MAX_ATTEMPTS: 'invalid' }), { timeout: 240000, total: 270000, attempts: 4 });
+  assert.deepEqual(requestLimits({}), { timeout: 270000, total: 280000, attempts: 4 });
+  assert.deepEqual(requestLimits({ LLM_REQUEST_TIMEOUT_MS: '99999999', LLM_TOTAL_TIMEOUT_MS: '99999999', LLM_MAX_ATTEMPTS: '99999' }), { timeout: 280000, total: 280000, attempts: 4 });
+  assert.deepEqual(requestLimits({ LLM_REQUEST_TIMEOUT_MS: '', LLM_TOTAL_TIMEOUT_MS: ' ', LLM_MAX_ATTEMPTS: 'invalid' }), { timeout: 270000, total: 280000, attempts: 4 });
   assert.deepEqual(requestLimits({ LLM_REQUEST_TIMEOUT_MS: '180000', LLM_TOTAL_TIMEOUT_MS: '240000', LLM_MAX_ATTEMPTS: '2' }), { timeout: 180000, total: 240000, attempts: 2 });
 });
 
@@ -518,14 +518,14 @@ test('a model response after the former attempt and total deadlines completes su
   let signal;
   globalThis.fetch = (_url, init) => new Promise((resolve, reject) => {
     signal = init.signal;
-    const timer = setTimeout(() => resolve(googleResponse('A complete long-document rewrite.')), 225000);
+    const timer = setTimeout(() => resolve(googleResponse('A complete long-document rewrite.')), 265000);
     signal.addEventListener('abort', () => {
       clearTimeout(timer);
       reject(new DOMException('aborted', 'AbortError'));
     }, { once: true });
   });
   const waiting = pooledComplete(options());
-  t.mock.timers.tick(225000);
+  t.mock.timers.tick(265000);
   const result = await waiting;
   assert.equal(result.text, 'A complete long-document rewrite.');
   assert.equal(signal.aborted, false);
@@ -545,7 +545,7 @@ test('a stalled model response body remains bounded by the longer default attemp
   };
   const waiting = assert.rejects(pooledComplete(options()), error => error.code === 'timeout');
   await ready;
-  t.mock.timers.tick(239999);
+  t.mock.timers.tick(269999);
   assert.equal(signal.aborted, false);
   t.mock.timers.tick(1);
   await waiting;
@@ -555,7 +555,7 @@ test('a stalled model response body remains bounded by the longer default attemp
 test('model and browser deadlines leave room around the deployed stage function limit', async () => {
   const config = JSON.parse(await readFile(new URL('../vercel.json', import.meta.url), 'utf8'));
   const functionLimit = config.functions['api/run-stage.js'].maxDuration * 1000;
-  assert.ok(MAX_MODEL_BUDGET_MS + 15000 < functionLimit, 'The Neon guard and response handling must fit after the model budget');
+  assert.ok(MAX_MODEL_BUDGET_MS + 15000 + 5000 <= functionLimit, 'Reserve 15 seconds for the Neon guard and 5 seconds for response handling');
   assert.ok(API_REQUEST_TIMEOUT_MS > functionLimit, 'The browser must wait long enough to receive a function response');
 });
 
