@@ -65,7 +65,7 @@ export const PROMPTS = {
 Rules:
 - Quote spans verbatim from the source, short and exact. Split quotations spanning blank-line-separated paragraphs into one span per paragraph. Record repeated facts or uncertainty markers separately for each occurrence.
 - "paragraph" is the explicit zero-based index on the <paragraph> containing the item. Use the supplied labels; never guess from visual wrapping or line breaks.
-- claims: each distinct assertion the document makes.
+- claims: every assertion occurrence the document makes. Record repeated assertions separately at their source locations; do not deduplicate them.
 - numbers: every quantity, percentage, date, amount, measurement or ranking.
 - named_entities: people, organisations, places, products, laws, studies.
 - citations: every reference, footnote marker, DOI or URL.
@@ -91,7 +91,7 @@ Rules:
     system: `You are an independent fact auditor. You compare a rewritten text against the FULL ORIGINAL source and its extraction, and report every difference. The extraction is an index, not an exhaustive substitute for reading the original. You do not fix anything. ${JSON_ONLY}
 
 Rules:
-- For each claim, number, entity, citation and quotation in the extraction, use its exact extracted value and the matching singular kind (claim, number, entity, citation, quotation), and decide status: "preserved", "altered", "missing", or "added".
+- For each claim, number, entity, citation and quotation in the extraction, copy its source_id, use its exact extracted value and the matching singular kind (claim, number, entity, citation, quotation), and decide status: "preserved", "altered", or "missing". Reserve status "added" with source_id: null for new facts introduced by the rewrite; an original extracted item must never have status "added".
 - Judge meaning, not wording: a reworded claim that says the same thing is preserved.
 - Report every certainty shift in the "certainty" array: status "strengthened", "weakened" or "none".
 - Report format violations in format_violations.

@@ -15,11 +15,13 @@ async function call(body, method = 'POST') {
 function configure(t, results = []) {
   const originalFetch = globalThis.fetch;
   const names = Object.keys(process.env).filter((name) => /^(GOOGLE|OPENROUTER|SAMBANOVA|CLOUDFLARE)_API_KEY|^UPSTASH_REDIS_|^VERCEL$|^(DATABASE_URL|NEON_DATABASE_URL|RATE_LIMIT_STORE)$/.test(name));
-  const previous = Object.fromEntries([...names, 'NODE_ENV', 'VERCEL_ENV', 'GOOGLE_API_KEY_1', 'OPENROUTER_API_KEY_1', 'AI_PROVIDER_MODE'].map((name) => [name, process.env[name]]));
+  const previous = Object.fromEntries([...names, 'NODE_ENV', 'VERCEL_ENV', 'GOOGLE_API_KEY_1', 'OPENROUTER_API_KEY_1', 'AI_PROVIDER_MODE', 'LLM_MAX_ATTEMPTS'].map((name) => [name, process.env[name]]));
   for (const name of names) delete process.env[name];
   process.env.GOOGLE_API_KEY_1 = 'synthetic-unit-test-key';
   process.env.NODE_ENV = 'test';
   process.env.AI_PROVIDER_MODE = 'configured';
+  // Single-response fixtures test fail-closed validation, not transport retries.
+  process.env.LLM_MAX_ATTEMPTS = '1';
   delete process.env.VERCEL_ENV;
   let calls = 0;
   globalThis.fetch = async () => {
@@ -380,4 +382,107 @@ test('configured paid-provider stages retain an approximate nonzero estimate', a
   assert.equal(response.statusCode, 200, JSON.stringify(response.body));
   assert.ok(response.body.patch.cost_estimate > 0);
   assert.equal(response.body.patch.cost_estimate, 0.00006);
+});
+
+test('an invalid extracted source span is regenerated within the same stage before advancing', async (t) => {
+  configure(t);
+  process.env.LLM_MAX_ATTEMPTS = '2';
+  const rejectedValue = 'PRIVATE_INVALID_SOURCE_VALUE_DO_NOT_ECHO';
+  const results = [{ ...extraction, numbers: [{ value: rejectedValue, paragraph: 9 }] }, extraction];
+  const prompts = [];
+  globalThis.fetch = async (_url, request) => {
+    prompts.push(JSON.parse(request.body).contents[0].parts[0].text);
+    return Response.json({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify(results.shift()) }] } }], usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10 } });
+  };
+  const response = await call({ stage: 'extract', job: { source_text: source } });
+  assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1], /SOURCE-SPAN HINT: numbers\[0\] references paragraph 9/);
+  assert.match(prompts[1], /authoritative <paragraph index=/);
+  assert.match(prompts[1], /exact, verbatim span/);
+  assert.doesNotMatch(prompts[1], new RegExp(rejectedValue));
+  assert.doesNotMatch(JSON.stringify(response.body), new RegExp(rejectedValue));
+  assert.equal(response.body.patch.extraction.numbers[0].value, '42');
+  assert.equal(response.body.patch.input_tokens, 20);
+  assert.equal(response.body.patch.output_tokens, 20);
+});
+
+test('schema retry hints identify required field paths and types without rejected model values', async (t) => {
+  configure(t);
+  process.env.LLM_MAX_ATTEMPTS = '2';
+  const privateValue = 'PRIVATE_PROVIDER_RESPONSE_DO_NOT_ECHO';
+  const results = [{ ...extraction, claims: [{ text: { private: privateValue }, paragraph: 0.5 }] }, extraction];
+  const prompts = [];
+  globalThis.fetch = async (_url, request) => {
+    prompts.push(JSON.parse(request.body).contents[0].parts[0].text);
+    return Response.json({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify(results.shift()) }] } }] });
+  };
+  const response = await call({ stage: 'extract', job: { source_text: source } });
+  assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1], /SCHEMA HINT \(extract\): claims\.0\.text requires a string; claims\.0\.paragraph requires an integer/);
+  assert.doesNotMatch(prompts[1], new RegExp(privateValue));
+  assert.doesNotMatch(JSON.stringify(response.body), new RegExp(privateValue));
+});
+
+test('exhausted validation errors expose neither internal hints nor rejected output', async (t) => {
+  const privateValue = 'PRIVATE_PROVIDER_RESPONSE_DO_NOT_ECHO';
+  configure(t, [{ ...extraction, claims: [{ text: { private: privateValue }, paragraph: 0 }] }]);
+  const response = await call({ stage: 'extract', job: { source_text: source } });
+  assert.equal(response.statusCode, 502);
+  assert.equal(response.body.code, 'invalid_schema');
+  assert.deepEqual(Object.keys(response.body).sort(), ['code', 'error']);
+  assert.doesNotMatch(JSON.stringify(response.body), /PRIVATE_PROVIDER|SCHEMA HINT|claims\.0|retryHint/);
+});
+
+test('a regenerated audit must still cover every source item before finalization', async (t) => {
+  const { job } = await throughAssembly(t);
+  process.env.LLM_MAX_ATTEMPTS = '2';
+  const results = [{ ...audit, items: [audit.items[0]] }, audit];
+  let calls = 0;
+  globalThis.fetch = async (_url, request) => {
+    calls++;
+    const prompt = JSON.parse(request.body).contents[0].parts[0].text;
+    if (calls === 2) {
+      assert.match(prompt, /do not change findings merely to pass validation/);
+      assert.match(prompt, /AUDIT-COVERAGE HINT/);
+      assert.match(prompt, /coverage does not require preserved statuses/);
+    }
+    return Response.json({
+      candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify(results.shift()) }] } }],
+      usageMetadata: { promptTokenCount: 11, candidatesTokenCount: 13 },
+    });
+  };
+  const response = await call({ stage: 'audit', job });
+  assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+  assert.equal(calls, 2);
+  assert.equal(response.body.patch.audit.items.length, 2);
+  assert.equal(response.body.patch.input_tokens, 52);
+  assert.equal(response.body.patch.output_tokens, 56);
+  Object.assign(job, response.body.patch);
+  const final = await call({ stage: 'finalize', job });
+  assert.equal(final.statusCode, 200, JSON.stringify(final.body));
+  assert.equal(final.body.patch.status, 'completed');
+});
+
+test('OpenRouter diagnosis requests reserve its short output allowance for visible JSON with minimal reasoning', async (t) => {
+  configure(t, [extraction]);
+  const job = { source_text: source };
+  const extracted = await call({ stage: 'extract', job });
+  assert.equal(extracted.statusCode, 200);
+  Object.assign(job, extracted.body.patch);
+  process.env.AI_PROVIDER_MODE = 'free';
+  process.env.OPENROUTER_API_KEY_1 = 'synthetic-free-diagnosis';
+  globalThis.fetch = async (url, request) => {
+    assert.equal(String(url), 'https://openrouter.ai/api/v1/chat/completions');
+    const body = JSON.parse(request.body);
+    assert.equal(body.model, 'openrouter/free');
+    assert.equal(body.max_tokens, 3000);
+    assert.deepEqual(body.reasoning, { effort: 'minimal' });
+    assert.deepEqual(body.response_format, { type: 'json_object' });
+    return Response.json({ choices: [{ message: { content: JSON.stringify(diagnosis) }, finish_reason: 'stop' }] });
+  };
+  const diagnosed = await call({ stage: 'diagnose', job });
+  assert.equal(diagnosed.statusCode, 200, JSON.stringify(diagnosed.body));
+  assert.deepEqual(diagnosed.body.patch.diagnosis, diagnosis);
 });

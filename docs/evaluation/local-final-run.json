@@ -1,0 +1,270 @@
+{
+  "startedAt": "2026-10-29T05:45:47.406Z",
+  "origin": "http://127.0.0.1:5192",
+  "scope": "local-development",
+  "transport": "Chromium network transport",
+  "sampleId": "fictional-pilot-v1",
+  "completed": false,
+  "pass": false,
+  "verificationComplete": false,
+  "health": [
+    {
+      "status": 200,
+      "mode": "free",
+      "configured": true,
+      "providerConfigured": true,
+      "protectionConfigured": true,
+      "protectionStore": "memory"
+    },
+    {
+      "status": 200,
+      "mode": "free",
+      "configured": true,
+      "providerConfigured": true,
+      "protectionConfigured": true,
+      "protectionStore": "memory"
+    }
+  ],
+  "stages": [
+    {
+      "stage": "extract",
+      "status": 200
+    },
+    {
+      "stage": "diagnose",
+      "status": 502,
+      "code": "invalid_json"
+    }
+  ],
+  "pageErrors": [],
+  "transportFailures": [],
+  "checks": {
+    "prerequisites": {
+      "status": "passed",
+      "freeOnly": true,
+      "configured": true,
+      "store": "memory"
+    },
+    "pipeline": {
+      "status": "failed",
+      "jobStatus": "running",
+      "auditPresent": false,
+      "unresolvedFlagCount": 0
+    },
+    "renderedText": {
+      "status": "not-run"
+    },
+    "download": {
+      "status": "not-run"
+    },
+    "markdownDownload": {
+      "status": "not-run"
+    },
+    "clipboard": {
+      "status": "not-run"
+    },
+    "rejectAll": {
+      "status": "not-run"
+    },
+    "acceptAll": {
+      "status": "not-run"
+    },
+    "noHistory": {
+      "status": "not-run"
+    },
+    "mobile": {
+      "status": "not-run"
+    }
+  },
+  "failure": "The AI provider returned invalid structured output. Please retry.",
+  "draftOnly": true,
+  "metrics": {
+    "sampleId": "fictional-pilot-v1",
+    "pass": false,
+    "hasText": false,
+    "styleImproved": false,
+    "factsPreserved": false,
+    "styleCounts": {
+      "before": 11,
+      "after": 0,
+      "reduction": 11,
+      "byPhrase": [
+        {
+          "phrase": "it is important to note",
+          "before": 1,
+          "after": 0
+        },
+        {
+          "phrase": "in today's rapidly evolving landscape",
+          "before": 1,
+          "after": 0
+        },
+        {
+          "phrase": "leverage",
+          "before": 1,
+          "after": 0
+        },
+        {
+          "phrase": "robust",
+          "before": 1,
+          "after": 0
+        },
+        {
+          "phrase": "seamless",
+          "before": 1,
+          "after": 0
+        },
+        {
+          "phrase": "furthermore",
+          "before": 1,
+          "after": 0
+        },
+        {
+          "phrase": "delve",
+          "before": 1,
+          "after": 0
+        },
+        {
+          "phrase": "moreover",
+          "before": 1,
+          "after": 0
+        },
+        {
+          "phrase": "pivotal",
+          "before": 1,
+          "after": 0
+        },
+        {
+          "phrase": "in conclusion",
+          "before": 1,
+          "after": 0
+        },
+        {
+          "phrase": "it is worth noting",
+          "before": 1,
+          "after": 0
+        }
+      ]
+    },
+    "checks": [
+      {
+        "label": "participant count",
+        "value": "42",
+        "preserved": false
+      },
+      {
+        "label": "estimated reduction",
+        "value": "12%",
+        "preserved": false
+      },
+      {
+        "label": "pilot start date",
+        "value": "14 March 2026",
+        "preserved": false
+      },
+      {
+        "label": "planned review date",
+        "value": "June 2026",
+        "preserved": false
+      },
+      {
+        "label": "organisation",
+        "value": "Northbridge Lab",
+        "preserved": false
+      },
+      {
+        "label": "named speaker",
+        "value": "Dr. Amina Khan",
+        "preserved": false
+      },
+      {
+        "label": "verbatim quotation",
+        "value": "The findings are preliminary.",
+        "preserved": false
+      },
+      {
+        "label": "citation marker",
+        "value": "[1]",
+        "preserved": false
+      },
+      {
+        "label": "reference URL",
+        "value": "https://example.org/pilot",
+        "preserved": false
+      }
+    ],
+    "uncertainty": [
+      {
+        "marker": "may",
+        "before": 1,
+        "after": 0,
+        "preserved": false
+      },
+      {
+        "marker": "approximately",
+        "before": 1,
+        "after": 0,
+        "preserved": false
+      },
+      {
+        "marker": "preliminary",
+        "before": 2,
+        "after": 0,
+        "preserved": false
+      }
+    ],
+    "numericValues": {
+      "before": [
+        "14",
+        "2026",
+        "42",
+        "12%",
+        "1",
+        "2026"
+      ],
+      "after": [],
+      "added": [],
+      "missing": [
+        {
+          "value": "14",
+          "count": 1
+        },
+        {
+          "value": "2026",
+          "count": 2
+        },
+        {
+          "value": "42",
+          "count": 1
+        },
+        {
+          "value": "12%",
+          "count": 1
+        },
+        {
+          "value": "1",
+          "count": 1
+        }
+      ],
+      "preserved": false
+    },
+    "wordCounts": {
+      "before": 187,
+      "after": 0
+    },
+    "limitations": "Dictionary and exact-span checks do not identify authorship, measure AI-detector performance, or prove semantic equivalence. Use the full audit and human review."
+  },
+  "job": {
+    "status": "running",
+    "provider": "openrouter",
+    "modelFast": "openrouter/nvidia/nemotron-3.5-super-vl:free",
+    "modelQuality": null,
+    "inputTokens": 764,
+    "outputTokens": 6238,
+    "estimatedModelCost": 0,
+    "repairLoops": 0
+  },
+  "applicationPass": false,
+  "outcome": "failed",
+  "finishedAt": "2026-10-29T05:48:30.752Z"
+}

@@ -6,7 +6,7 @@ import pluginUnusedImports from "eslint-plugin-unused-imports";
 
 export default [
   {
-    files: ['api/**/*.js', 'scripts/**/*.js', 'tests/**/*.js', 'e2e/**/*.js', 'vite.config.js', 'playwright.config.js'],
+    files: ['api/**/*.js', 'scripts/**/*.js', 'shared/**/*.js', 'evaluation/**/*.js', 'tests/**/*.js', 'e2e/**/*.js', 'vite.config.js', 'playwright.config.js'],
     ...pluginJs.configs.recommended,
     languageOptions: { globals: globals.node, ecmaVersion: 2022, sourceType: 'module' },
     rules: { 'no-unused-vars': ['error', { argsIgnorePattern: '^_' }] },

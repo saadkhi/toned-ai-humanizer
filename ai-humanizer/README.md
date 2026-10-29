@@ -40,7 +40,17 @@ Each provider supports `_KEY_2` and `_KEY_3` for rotation and a singular `*_API_
 
 `GOOGLE_API_KEY_1` is not required when `GOOGLE_API_KEY` is set. Key rotation continues across requests within each running server instance; a new instance starts its own rotation. Changing the configured key set resets that provider's pool.
 
-In configured mode, provider calls use Google → OpenRouter → SambaNova → Cloudflare for both structured and prose stages, skipping unconfigured providers. They default to 60 seconds per attempt, up to four attempts, and a 120-second total budget shared across attempts. This permits fallback after an immediate rejection without extending the request deadline. Override with `LLM_REQUEST_TIMEOUT_MS`, `LLM_MAX_ATTEMPTS` (maximum four), and `LLM_TOTAL_TIMEOUT_MS` (maximum 120,000); an explicit lower attempt limit may skip later providers. Retries may incur additional provider charges. Stopping a rewrite prevents subsequent browser requests; an already-running model call may still finish and incur a charge.
+In configured mode, provider calls use Google → OpenRouter → SambaNova → Cloudflare for both structured and prose stages, skipping unconfigured providers. In both modes, calls allow **four minutes per attempt**, up to four attempts, and **four minutes thirty seconds total per stage**, shared across all retries. A slow first attempt leaves only the remaining stage budget for fallback; retries do not multiply the total wait.
+
+| Server setting | Default | Maximum |
+| --- | --- | --- |
+| `LLM_REQUEST_TIMEOUT_MS` | `240000` (4 minutes per attempt) | `270000` |
+| `LLM_TOTAL_TIMEOUT_MS` | `270000` (4 minutes 30 seconds across attempts) | `270000` |
+| `LLM_MAX_ATTEMPTS` | `4` | `4` |
+
+The browser and live-test transport wait 310 seconds for each API response. Vercel's stage function is configured for 300 seconds; the shorter model budget leaves time for request protection, validation, and response handling. Keep Fluid compute enabled for that function duration on Vercel Hobby. Timeouts cannot be unlimited on this host. Long documents still use sequential sections, each with a fresh stage budget, so the whole rewrite may take longer than five minutes. Stop/cancel controls remain available.
+
+If Vercel already defines the old timeout overrides, **remove them to use the new defaults**, or set `LLM_REQUEST_TIMEOUT_MS=240000` and `LLM_TOTAL_TIMEOUT_MS=270000`, then redeploy. Blank overrides also use defaults. Lower explicit overrides remain supported; an explicit lower attempt limit may skip later providers. Retries may incur additional provider charges. Stopping a rewrite prevents subsequent browser requests; an already-running model call may still finish and incur a charge.
 
 Never prefix a secret with `VITE_`: those variables are intended for browser bundles. Cloud environment settings and Vercel project environment variables are separate; configure the target where you run the application.
 
@@ -48,7 +58,8 @@ Never prefix a secret with `VITE_`: those variables are intended for browser bun
 
 The browser drives individually bounded server requests: extraction → diagnosis → sequential section rewrites → lossless assembly → independent audit → up to two repairs and re-audits → finalization.
 
-- Structured model results are validated before advancing a stage.
+- Structured model results are validated before advancing a stage. Invalid JSON, schema failures, missing extracted facts, and incomplete audit coverage trigger a fresh model attempt within the same four-attempt/270-second budget. Validation stays strict; exhausting that budget returns an error. Usage includes completed responses rejected by validation.
+- The short diagnosis stage requests OpenRouter's `reasoning.effort=minimal`, leaving more of its output allowance for the required JSON when the free router selects a reasoning model. Extraction and auditing retain their existing reasoning behavior. Provider limits or truncation can still cause a visible failure.
 - Source/settings fingerprints invalidate stale pipeline state.
 - Long paragraphs are split into bounded sections; assembly requires all sections.
 - The auditor sees the full original and rewrite, without the rewrite plan. Stable source IDs require coverage of each extracted occurrence, including repeated facts and uncertainty markers. It checks additions, omissions, certainty, and requested formatting.
@@ -69,7 +80,7 @@ Before allowing public traffic:
 
 1. Keep `AI_PROVIDER_MODE=free` with a valid OpenRouter key for free-only routing, or explicitly opt in to configured mode with a valid provider credential and any model overrides in Vercel server environment settings.
 2. Configure **one** shared request-limit store: [Neon Postgres](#neon-postgres-setup) or [Upstash Redis](#upstash-redis-setup). Both offer Free plans with quotas. Use `RATE_LIMIT_STORE=neon` or `RATE_LIMIT_STORE=upstash` to make the choice explicit. Keep connection credentials server-only and allow outbound requests to the actual database hostname.
-3. Review `RATE_LIMIT_REQUESTS` (default 60 stage calls per client per 600 seconds) and `DAILY_STAGE_LIMIT` (default 1,000 stage calls globally per UTC day). These count requests, including retries, not documents or currency. A normal document uses multiple calls. Apply provider-side billing limits and deployment firewall/bot protection appropriate to your traffic.
+3. Review `RATE_LIMIT_REQUESTS` (default 60 stage calls per client per 600 seconds) and `DAILY_STAGE_LIMIT` (default 1,000 stage calls globally per UTC day). These count API stage requests, including browser retries, not documents or currency. Internal model retries share one stage admission and have their own bounded attempt budget. A normal document uses multiple calls. Apply provider-side billing limits and deployment firewall/bot protection appropriate to your traffic.
 4. Run checks below. Validate a representative rewrite with the actual model/key and review its audit. Test deployment routes and headers. A green health response alone does not validate a key, database connectivity, installed Neon schema, or output quality.
 5. Deploy through your normal release process. This setup does not publish or deploy the app.
 
@@ -172,9 +183,12 @@ See the [release verification report](../docs/browser-audit.md) for the browser 
 ```bash
 npm run check          # lint, Node regression tests, production build
 npm run test:e2e       # browser checks with mocked AI responses; no billable calls
+npm run evaluate:live  # manual real free-model check of the public deployment
 ```
 
-Install a Playwright Chromium browser using `npx playwright install chromium`, or set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium` when using a system browser. CI installs the pinned Playwright browser. Unit and browser tests exercise failure handling and deterministic fixtures, not statistical model accuracy. A real-provider evaluation set is still needed before making measured accuracy claims.
+Install a Playwright Chromium browser using `npx playwright install chromium`, or set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium` when using a system browser. CI installs the pinned Playwright browser. Unit and browser tests exercise failure handling and deterministic fixtures, not statistical model accuracy.
+
+The [manual rewrite evaluation](evaluation/README.md) submits a 187-word synthetic AI-style document through the real editor, provider, audit, review controls, clipboard, downloads, and mobile layout. It records the actual input/output, stage trace, constraint checks, and screenshots. It fails on incomplete auditing or unverified required checks and uses only free model routing. A passing sample cannot establish human authorship, detector performance, perfect accuracy, or broad model reliability; those require different evidence and a larger evaluation set.
 
 ## Provider availability and billing errors
 

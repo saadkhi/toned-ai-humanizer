@@ -77,6 +77,23 @@ test('cancelling a request stops the client wait with a readable message', async
   await assert.rejects(waiting, { name: 'AbortError', message: 'Rewrite stopped. Your original text is unchanged.' });
 });
 
+test('the browser can receive a stage response after the former browser timeout', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  let signal;
+  t.mock.method(globalThis, 'fetch', (_url, init) => new Promise((resolve, reject) => {
+    signal = init.signal;
+    const timer = setTimeout(() => resolve(Response.json({ stage: 'audit', patch: { progress: 85 } })), 300000);
+    signal.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(new DOMException('aborted', 'AbortError'));
+    }, { once: true });
+  }));
+  const waiting = requestJson('/api/run-stage');
+  t.mock.timers.tick(300000);
+  assert.deepEqual(await waiting, { stage: 'audit', patch: { progress: 85 } });
+  assert.equal(signal.aborted, false);
+});
+
 test('the client rewrites chunks in order, re-audits repairs, and persists final patches', async (t) => {
   setupStorage(t);
   const job = await createJob({

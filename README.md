@@ -211,11 +211,14 @@ From `ai-humanizer/`:
 ```bash
 npm run check          # lint, regression tests, production build
 npm run test:e2e       # browser workflows with mocked provider responses
+npm run evaluate:live  # manual real free-model evaluation against the public app
 ```
 
 Browser tests need Chromium. Install it with `npx playwright install chromium`, or use an installed browser through `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`. CI installs its own browser.
 
 Automated fixtures exercise the workflow and its failure paths; they do not measure live model accuracy. Usage cost figures in the app are rough estimates, not provider invoices or subscription prices.
+
+The [real rewrite evaluation](docs/rewrite-evaluation.md) records the synthetic sample, exact acceptance checks, observed production failures, fixes, and deployment status. See the [runner guide](ai-humanizer/evaluation/README.md) to generate input/output reports and browser screenshots yourself.
 
 ## Feedback that makes the editor better
 

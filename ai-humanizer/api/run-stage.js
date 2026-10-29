@@ -6,7 +6,7 @@ import { getProviderConfig } from './_config.js';
 import { guardApiRequest } from './_security.js';
 import {
   auditProblems, deterministicChecks, estimateCost, intentCheck, LLMError,
-  pooledComplete, runJsonStagePooled, splitChunks, summarizeAudit, wordCount, wrapUserText,
+  pooledComplete, runJsonStagePooled, splitChunks, summarizeAudit, wordCount, withStructuredRetryHint, wrapUserText,
 } from './_pipeline.js';
 import { AI_PATTERN_CATALOG, PROMPTS, REWRITE_SYSTEM, STAGE_SCHEMAS, STYLE_MODULES } from './_prompts.js';
 
@@ -37,7 +37,14 @@ function requireState(condition, message) {
 }
 function parseStage(stage, data) {
   const parsed = STAGE_SCHEMAS[stage].safeParse(data);
-  if (!parsed.success) throw new LLMError('The AI response did not match the required structure. Please retry this stage.', 'invalid_schema', 502);
+  if (!parsed.success) {
+    const issues = parsed.error.issues.slice(0, 4).map((issue) => ({
+      path: issue.path,
+      expected: issue.code === 'invalid_type' ? issue.expected === 'int' ? 'integer' : issue.expected : issue.code === 'invalid_value' ? 'enum'
+        : ['too_small', 'too_big'].includes(issue.code) ? 'bounds' : 'contract',
+    }));
+    throw withStructuredRetryHint(new LLMError('The AI response did not match the required structure. Please retry this stage.', 'invalid_schema', 502), { kind: 'schema', stage, issues });
+  }
   return parsed.data;
 }
 function usage(job, result, tier) {
@@ -73,7 +80,7 @@ function validateExtraction(data, source) {
       const paragraph = paragraphs[item.paragraph];
       const key = JSON.stringify([item.paragraph, item[field]]);
       const offset = paragraph?.text.indexOf(item[field], occurrences.get(key) || 0) ?? -1;
-      if (offset < 0) throw new LLMError('The extraction contained an invalid source span or paragraph. Please retry.', 'invalid_extraction', 502);
+      if (offset < 0) throw withStructuredRetryHint(new LLMError('The extraction contained an invalid source span or paragraph. Please retry.', 'invalid_extraction', 502), { kind: 'source_span', category, index, paragraph: item.paragraph });
       occurrences.set(key, offset + item[field].length);
       return { ...item, source_id: `${category}:${index}`, source_start: paragraph.start + offset, source_end: paragraph.start + offset + item[field].length };
     });
@@ -82,16 +89,17 @@ function validateExtraction(data, source) {
 }
 function validateAudit(data, extraction) {
   const parsed = parseStage('audit', data);
+  const coverageError = (message) => withStructuredRetryHint(new LLMError(message, 'incomplete_audit', 502), { kind: 'audit_coverage' });
   const expected = new Map(extractionItems(extraction).map((item) => [item.source_id, item]));
   const checked = new Set();
   for (const item of parsed.items) {
     if (item.status === 'added') {
-      if (item.source_id !== null) throw new LLMError('Added audit findings must be separate from original source items.', 'incomplete_audit', 502);
+      if (item.source_id !== null) throw coverageError('Added audit findings must be separate from original source items.');
       continue;
     }
     const original = expected.get(item.source_id);
     if (!original || original.kind !== item.kind || original.value !== item.value || checked.has(item.source_id)) {
-      throw new LLMError('The audit did not match each original fact exactly once. Please retry the audit.', 'incomplete_audit', 502);
+      throw coverageError('The audit did not match each original fact exactly once. Please retry the audit.');
     }
     checked.add(item.source_id);
   }
@@ -99,10 +107,10 @@ function validateAudit(data, extraction) {
   const certaintyChecked = new Set();
   for (const item of parsed.certainty) {
     if (item.source_id === null && item.status !== 'none') continue;
-    if (hedges.get(item.source_id) !== item.marker || certaintyChecked.has(item.source_id)) throw new LLMError('The audit did not match each certainty marker exactly once. Please retry the audit.', 'incomplete_audit', 502);
+    if (hedges.get(item.source_id) !== item.marker || certaintyChecked.has(item.source_id)) throw coverageError('The audit did not match each certainty marker exactly once. Please retry the audit.');
     certaintyChecked.add(item.source_id);
   }
-  if (checked.size !== expected.size || certaintyChecked.size !== hedges.size) throw new LLMError('The audit did not cover every extracted fact and certainty marker. Please retry the audit.', 'incomplete_audit', 502);
+  if (checked.size !== expected.size || certaintyChecked.size !== hedges.size) throw coverageError('The audit did not cover every extracted fact and certainty marker. Please retry the audit.');
   return parsed;
 }
 function preserveBoundaryWhitespace(rewritten, original) {
@@ -166,6 +174,9 @@ export default async function handler(req, res) {
     const providerArgs = { pools: config.pools, models: config.models, accountIds: config.accountIds };
     const jsonStage = (name, user, tier = 'fast', validator = (data) => parseStage(name, data)) => runJsonStagePooled({
       ...providerArgs, tier, system: PROMPTS[name].system, user, maxTokens: PROMPTS[name].maxTokens, validate: validator,
+      // The short editorial diagnosis must leave room for visible JSON when
+      // the free router selects a model that includes reasoning in max_tokens.
+      minimalReasoning: name === 'diagnose',
     });
     if (stage === 'extract') {
       if (job.pipeline_fingerprint === fingerprint && STAGE_SCHEMAS.extract.safeParse(job.extraction).success && job.chunks?.length === sourceChunks.length) return res.json({ stage, cached: true, chunk_count: job.chunks.length, progress: 15, patch: {} });

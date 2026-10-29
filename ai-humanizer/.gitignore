@@ -42,3 +42,6 @@ dist-ssr
 playwright-report/
 test-results/
 .neon
+
+# Manual live evaluation reports (synthetic fixture runs or local inspection).
+evaluation-results/

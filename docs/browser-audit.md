@@ -1,5 +1,7 @@
 # Release verification · 28 October 2026
 
+**Latest status, 29 October:** see the [full synthetic rewrite evaluation](rewrite-evaluation.md). Production request protection now accepts real stage calls after the Neon migration, but real free-model runs failed before finalization. The current automated suite passes 176 regression tests and 29 browser tests; this is not a passing live model evaluation.
+
 This report records checks against the repository in the cloud development environment. The initial public-site inspection was blocked by the environment proxy. A later live check reached the deployment and confirmed a configuration blocker; see the follow-up below.
 
 ## Changes verified

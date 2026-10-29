@@ -1,5 +1,7 @@
 /** JSON requests with bounded waits and cancellation. Credentials stay on the server. */
-export async function requestJson(url, { timeoutMs = 245000, signal, allowUnavailable = false, ...options } = {}) {
+import { API_REQUEST_TIMEOUT_MS } from '../../shared/timeouts.js';
+
+export async function requestJson(url, { timeoutMs = API_REQUEST_TIMEOUT_MS, signal, allowUnavailable = false, ...options } = {}) {
   const controller = new AbortController();
   let timedOut = false;
   const abort = () => controller.abort();

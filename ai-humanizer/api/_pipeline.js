@@ -2,6 +2,7 @@
  * Shared pipeline utilities for Vercel API routes.
  * Bounded provider calls, structured responses, and factual consistency checks.
  */
+import { DEFAULT_MODEL_TIMEOUT_MS, MAX_MODEL_BUDGET_MS } from '../shared/timeouts.js';
 
 // ─── LLM Error ────────────────────────────────────────────────────────────────
 
@@ -64,16 +65,18 @@ export class KeyPool {
 }
 
 // Each model call has a bounded total budget, including response-body reads and retries.
-// Two model calls can occur in a stage; the default keeps both below Vercel's 300s limit.
+// One model call (including retries) runs per stage. Reserve time for the
+// shared limiter and response handling below Vercel's 300-second limit.
 function boundedInt(value, fallback, min, max) {
+  if (value == null || String(value).trim() === '') return fallback;
   const number = Number(value);
   return Number.isFinite(number) ? Math.max(min, Math.min(max, Math.floor(number))) : fallback;
 }
 
 export function requestLimits(env = process.env) {
   return {
-    timeout: boundedInt(env.LLM_REQUEST_TIMEOUT_MS, 60000, 100, 60000),
-    total: boundedInt(env.LLM_TOTAL_TIMEOUT_MS, 120000, 100, 120000),
+    timeout: boundedInt(env.LLM_REQUEST_TIMEOUT_MS, DEFAULT_MODEL_TIMEOUT_MS, 100, MAX_MODEL_BUDGET_MS),
+    total: boundedInt(env.LLM_TOTAL_TIMEOUT_MS, MAX_MODEL_BUDGET_MS, 100, MAX_MODEL_BUDGET_MS),
     attempts: boundedInt(env.LLM_MAX_ATTEMPTS, 4, 1, 4),
   };
 }
@@ -158,7 +161,7 @@ async function callGoogle({ key, model, system, user, maxTokens, json, timeout }
   };
 }
 
-async function callChat({ provider, key, model, system, user, maxTokens, json, timeout }) {
+async function callChat({ provider, key, model, system, user, maxTokens, json, timeout, minimalReasoning }) {
   const endpoint = provider === 'openrouter'
     ? 'https://openrouter.ai/api/v1/chat/completions'
     : 'https://api.sambanova.ai/v1/chat/completions';
@@ -171,6 +174,7 @@ async function callChat({ provider, key, model, system, user, maxTokens, json, t
       max_tokens: maxTokens || 4000,
       temperature: json ? 0 : 0.2,
       ...(json ? { response_format: { type: 'json_object' } } : {}),
+      ...(provider === 'openrouter' && minimalReasoning === true ? { reasoning: { effort: 'minimal' } } : {}),
     }),
   }, timeout);
   // A router can resolve to a different model. Retain that public identifier for
@@ -208,8 +212,52 @@ async function callCloudflare({ key, model, system, user, maxTokens, accountId, 
   };
 }
 
+const VALIDATION_ERROR_PRIORITY = {
+  invalid_json: 1, invalid_schema: 2, invalid_extraction: 3, incomplete_audit: 3,
+};
+const STRUCTURED_RETRY_INSTRUCTION = 'The previous response did not satisfy the response contract. Re-evaluate the original data and return one complete JSON object matching every required field. Preserve each supplied source_id exactly; never invent IDs. Report genuine discrepancies and do not change findings merely to pass validation. Return no preamble, code fences, or trailing commentary.';
+const tokenCount = (value) => Number.isSafeInteger(value) && value > 0 ? value : 0;
+// Only server-created, allowlisted contract metadata reaches retry prompts.
+// A WeakMap keeps these hints out of public errors and serialized responses.
+const structuredRetryHints = new WeakMap();
+const extractionCategories = new Set(['claims', 'numbers', 'named_entities', 'citations', 'quotations', 'hedge_markers']);
+const schemaHintFields = {
+  extract: new Set([...extractionCategories, 'text', 'value', 'name', 'paragraph', 'source_id']),
+  diagnose: new Set(['purpose_guess', 'audience_guess', 'patterns', 'pattern', 'location', 'severity', 'ambiguous_sentences', 'sentence', 'reason', 'plan', 'register', 'target_sentence_length_distribution', 'transition_policy', 'structural_changes']),
+  audit: new Set(['items', 'source_id', 'kind', 'value', 'status', 'note', 'certainty', 'marker', 'format_violations', 'rule', 'summary']),
+  repair: new Set(['text', 'fixes', 'item', 'action']),
+  consistency: new Set(['text', 'edits']),
+};
+const schemaHintExpectations = {
+  string: 'a string', number: 'a number', integer: 'an integer', array: 'an array', object: 'an object',
+  boolean: 'a boolean', enum: 'an allowed enum value', bounds: 'a value within the schema bounds', contract: 'a value matching the schema contract',
+};
+export function withStructuredRetryHint(error, hint) {
+  if (!(error instanceof LLMError) || !hint || typeof hint !== 'object') return error;
+  let message = '';
+  if (error.code === 'invalid_extraction' && hint.kind === 'source_span'
+    && extractionCategories.has(hint.category) && Number.isSafeInteger(hint.index) && hint.index >= 0 && hint.index < 2000
+    && Number.isSafeInteger(hint.paragraph) && hint.paragraph >= 0) {
+    message = `SOURCE-SPAN HINT: ${hint.category}[${hint.index}] references paragraph ${hint.paragraph}. Use the authoritative <paragraph index="..."> labels and copy an exact, verbatim span from the item's actual source paragraph. Do not normalize or invent a value. Repeated items must each correspond to a separate source occurrence.`;
+  } else if (error.code === 'invalid_schema' && hint.kind === 'schema'
+    && Object.hasOwn(schemaHintFields, hint.stage) && Array.isArray(hint.issues)) {
+    const fields = schemaHintFields[hint.stage];
+    const issues = hint.issues.slice(0, 4).filter((issue) => issue && Array.isArray(issue.path)
+      && issue.path.length <= 4 && Object.hasOwn(schemaHintExpectations, issue.expected)
+      && issue.path.every((part) => typeof part === 'string' ? fields.has(part) : Number.isSafeInteger(part) && part >= 0 && part < 2000));
+    if (issues.length) {
+      const details = issues.map((issue) => `${issue.path.length ? issue.path.join('.') : '(root)'} requires ${schemaHintExpectations[issue.expected]}`).join('; ');
+      message = `SCHEMA HINT (${hint.stage}): ${details}. Include every required field; use empty arrays when there are no items and string notes rather than null.`;
+    }
+  } else if (error.code === 'incomplete_audit' && hint.kind === 'audit_coverage') {
+    message = 'AUDIT-COVERAGE HINT: Include exactly one item per extracted source_id with its exact value and singular kind, and exactly one certainty entry per extracted hedge occurrence, including unchanged markers. Reserve status added and source_id null for new facts. Keep all findings truthful; coverage does not require preserved statuses.';
+  }
+  if (message) structuredRetryHints.set(error, message);
+  return error;
+}
+
 export async function pooledComplete({
-  pools, models, accountIds = {}, tier = 'fast', system, user, maxTokens, json = false,
+  pools, models, accountIds = {}, tier = 'fast', system, user, maxTokens, json = false, parseResponse, minimalReasoning = false,
 }) {
   // Use the same accuracy-focused order for structured and prose stages. A
   // rejected model on one provider must not hide a working configured fallback.
@@ -221,7 +269,14 @@ export async function pooledComplete({
   const deadline = Date.now() + limits.total;
   let lastError;
   let billingError;
+  let validationError;
+  let retryStructuredOutput = false;
+  let validationRetryHint = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let allResponsesFree = true;
   const attemptedKeys = new Map(available.map((provider) => [provider, new Set()]));
+  const permanentKeys = new Map(available.map((provider) => [provider, new Set()]));
   const unavailable = new Set();
   const retryable = new Set();
   let cursor = 0;
@@ -244,7 +299,7 @@ export async function pooledComplete({
     if (!selected) {
       // Reuse a key for transient failures only after all fresh alternatives.
       // Permanent credential rejections cannot loop on the same failed key.
-      for (const provider of retryable) attemptedKeys.get(provider).clear();
+      for (const provider of retryable) attemptedKeys.set(provider, new Set(permanentKeys.get(provider)));
       selected = select();
     }
     if (!selected) break;
@@ -258,33 +313,64 @@ export async function pooledComplete({
       preferred = undefined;
       continue;
     }
-    const options = { key, model, system, user, maxTokens, json, timeout: Math.min(remaining, limits.timeout) };
+    const options = {
+      key, model, system, user: retryStructuredOutput ? [user, STRUCTURED_RETRY_INSTRUCTION, validationRetryHint].filter(Boolean).join('\n\n') : user,
+      maxTokens, json, minimalReasoning, timeout: Math.min(remaining, limits.timeout),
+    };
     const started = Date.now();
+    let parsingResponse = false;
     try {
       let result;
       if (provider === 'google') result = await callGoogle(options);
       else if (provider === 'cloudflare') result = await callCloudflare({ ...options, accountId: accountIds.cloudflare });
       else result = await callChat({ ...options, provider });
+      // Invalid structured output still consumed model tokens. Count every
+      // completed response, retaining the successful model's provenance below.
+      inputTokens = Math.min(Number.MAX_SAFE_INTEGER, inputTokens + tokenCount(result.inputTokens));
+      outputTokens = Math.min(Number.MAX_SAFE_INTEGER, outputTokens + tokenCount(result.outputTokens));
+      allResponsesFree = allResponsesFree && result.free === true;
+      // Parsers/validators are synchronous server-side contracts. Never let an
+      // accidentally async callback turn an unchecked Promise into stage data.
+      parsingResponse = true;
+      const data = parseResponse ? parseResponse(result) : undefined;
+      if (data && typeof data.then === 'function') {
+        if (data instanceof Promise) void data.catch(() => {});
+        throw new LLMError('The AI response validator could not complete synchronously.', 'invalid_schema', 502);
+      }
+      parsingResponse = false;
+      if (Date.now() > deadline) throw new LLMError('The AI request timed out.', 'timeout', 504);
       pool.markSuccess(key);
       return {
         ...result,
+        ...(parseResponse ? { data } : {}),
+        inputTokens,
+        outputTokens,
         model: `${provider}/${result.model || model}`,
         requestedModel: `${provider}/${model}`,
         provider,
-        free: result.free === true,
+        free: allResponsesFree,
         latencyMs: Date.now() - started,
       };
     } catch (error) {
-      pool.markFailed(key);
       lastError = error instanceof LLMError ? error : new LLMError('The AI request failed.', 'provider_error', 502);
+      const validationPriority = Object.hasOwn(VALIDATION_ERROR_PRIORITY, lastError.code) ? VALIDATION_ERROR_PRIORITY[lastError.code] : 0;
+      // Internal state errors are not model output that another attempt can fix.
+      if (parsingResponse && !validationPriority) throw lastError;
+      pool.markFailed(key);
       if (lastError.code === 'provider_billing_required') billingError = lastError;
+      if (validationPriority) {
+        if (!validationError || validationPriority >= VALIDATION_ERROR_PRIORITY[validationError.code]) validationError = lastError;
+        retryStructuredOutput = true;
+        validationRetryHint = structuredRetryHints.get(lastError) || '';
+      }
       const status = lastError.upstreamStatus;
       if ([400, 404, 405, 422].includes(status)) {
         unavailable.add(provider);
         retryable.delete(provider);
-      } else if (['upstream_unavailable', 'network_error', 'timeout', 'invalid_response', 'empty_response', 'truncated_response'].includes(lastError.code)) {
+      } else if (validationPriority || ['upstream_unavailable', 'network_error', 'timeout', 'invalid_response', 'empty_response', 'truncated_response'].includes(lastError.code)) {
         retryable.add(provider);
       }
+      if ([401, 402, 403].includes(status)) permanentKeys.get(provider).add(key);
       // A provider may have one usable binding among several unavailable keys.
       // Try its untried alternatives before spending the bounded attempt budget
       // on unrelated providers; a model-level rejection skips the entire pool.
@@ -295,7 +381,7 @@ export async function pooledComplete({
       }
     }
   }
-  throw billingError || lastError || new LLMError('The AI request timed out.', 'timeout', 504);
+  throw billingError || validationError || lastError || new LLMError('The AI request timed out.', 'timeout', 504);
 }
 
 function extractJson(text) {
@@ -306,25 +392,34 @@ function extractJson(text) {
 }
 
 export async function runJsonStagePooled({ validate, ...options }) {
-  const result = await pooledComplete({ ...options, json: true });
-  let data;
-  try {
-    data = extractJson(result.text);
-  } catch {
-    throw new LLMError('The AI provider returned invalid structured output. Please retry.', 'invalid_json', 502);
-  }
-  try {
-    if (validate) {
-      const validated = validate(data);
-      if (validated === false) throw new Error('Invalid schema');
-      if (validated && typeof validated === 'object') data = validated;
+  const result = await pooledComplete({
+    ...options, json: true,
+    parseResponse(response) {
+      let data;
+      try {
+        data = extractJson(response.text);
+      } catch {
+        throw new LLMError('The AI provider returned invalid structured output. Please retry.', 'invalid_json', 502);
+      }
+      try {
+        if (validate) {
+          const validated = validate(data);
+          if (validated && typeof validated.then === 'function') {
+            if (validated instanceof Promise) void validated.catch(() => {});
+            throw new Error('Synchronous validator required');
+          }
+          if (validated === false) throw new Error('Invalid schema');
+          if (validated && typeof validated === 'object') data = validated;
+        }
+      } catch (error) {
+        if (error instanceof LLMError) throw error;
+        throw new LLMError('The AI response did not meet the required format. Please retry.', 'invalid_schema', 502);
+      }
+      return data;
     }
-  } catch (error) {
-    if (error instanceof LLMError) throw error;
-    throw new LLMError('The AI response did not meet the required format. Please retry.', 'invalid_schema', 502);
-  }
+  });
   return {
-    data,
+    data: result.data,
     usage: { inputTokens: result.inputTokens, outputTokens: result.outputTokens, free: result.free },
     model: result.model,
     requestedModel: result.requestedModel,

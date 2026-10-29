@@ -12,7 +12,8 @@
     "test": "node --test tests/*.test.js",
     "test:e2e": "playwright test",
     "check": "npm run lint && npm test && npm run build",
-    "db:check": "node scripts/check-neon.js"
+    "db:check": "node scripts/check-neon.js",
+    "evaluate:live": "node scripts/evaluate-live.js"
   },
   "dependencies": {
     "@hello-pangea/dnd": "^17.0.0",

@@ -1,7 +1,9 @@
 import test, { afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { LLMError, pooledComplete, runJsonStagePooled, deterministicChecks, auditProblems, splitChunks, requestLimits, wrapUserText, MAX_CHUNK_CHARACTERS } from '../api/_pipeline.js';
+import { LLMError, pooledComplete, runJsonStagePooled, deterministicChecks, auditProblems, splitChunks, requestLimits, withStructuredRetryHint, wrapUserText, MAX_CHUNK_CHARACTERS } from '../api/_pipeline.js';
 import { loadProviderConfig } from '../api/_config.js';
+import { readFile } from 'node:fs/promises';
+import { API_REQUEST_TIMEOUT_MS, MAX_MODEL_BUDGET_MS } from '../shared/timeouts.js';
 
 const originalFetch = globalThis.fetch;
 const originalEnv = { ...process.env };
@@ -72,6 +74,17 @@ test('a resolved model suffix cannot turn a requested paid route into free usage
   assert.equal(result.free, false);
   assert.equal(result.requestedModel, 'openrouter/vendor/paid-model');
   assert.equal(result.model, 'openrouter/vendor/resolved-model:free');
+});
+
+test('minimal reasoning is opt-in and never sent to a different chat provider', async () => {
+  const bodies = [];
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return Response.json({ choices: [{ message: { content: 'A complete rewrite.' }, finish_reason: 'stop' }] });
+  };
+  await pooledComplete({ ...loadProviderConfig({ OPENROUTER_API_KEY: 'synthetic-free' }), system: 'Edit.', user: 'Text.' });
+  await pooledComplete({ ...configured({ SAMBANOVA_API_KEY: 'synthetic-samba' }), system: 'Edit.', user: 'Text.', minimalReasoning: true });
+  assert.ok(bodies.every(body => !Object.hasOwn(body, 'reasoning')));
 });
 
 test('exhausted free-tier capacity never falls back to injected paid providers or model overrides', async () => {
@@ -285,6 +298,207 @@ test('schema validation rejects syntactically valid but incomplete stage results
   await assert.rejects(runJsonStagePooled({ ...options(), validate(data) { if (!Array.isArray(data.items)) throw new Error('private validator text'); } }), (error) => error.code === 'invalid_schema' && !error.message.includes('private'));
 });
 
+test('structured retries regenerate malformed output within the original attempt budget and count every completed response', async () => {
+  process.env.LLM_MAX_ATTEMPTS = '2';
+  const prompts = [];
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    prompts.push(body.contents[0].parts[0].text);
+    assert.equal(body.generationConfig.maxOutputTokens, 3000);
+    return googleResponse(prompts.length === 1 ? 'Private malformed output' : '{"items":[]}');
+  };
+  const result = await runJsonStagePooled({
+    ...options(), maxTokens: 3000,
+    validate(data) { assert.ok(Array.isArray(data.items)); },
+  });
+  assert.deepEqual(result.data, { items: [] });
+  assert.deepEqual(result.usage, { inputTokens: 20, outputTokens: 40, free: false });
+  assert.equal(prompts.length, 2);
+  assert.equal(prompts[0], 'Example input');
+  assert.match(prompts[1], /Report genuine discrepancies/);
+  assert.match(prompts[1], /complete JSON object/);
+  assert.doesNotMatch(prompts[1], /Private malformed output/);
+  assert.equal(result.model, 'google/gemini-2.5-flash');
+});
+
+test('schema and audit coverage failures are retried without weakening source checks', async () => {
+  process.env.LLM_MAX_ATTEMPTS = '3';
+  let calls = 0;
+  globalThis.fetch = async () => googleResponse(JSON.stringify(++calls === 1 ? { unexpected: 'Private rejected data' } : calls === 2 ? { items: [] } : { items: [{ source_id: 'claims:0', status: 'missing' }] }));
+  const result = await runJsonStagePooled({
+    ...options(),
+    validate(data) {
+      if (!Array.isArray(data.items)) throw new Error('Private schema-validator details');
+      if (!data.items.some((item) => item.source_id === 'claims:0')) throw new LLMError('The audit must cover every original source item.', 'incomplete_audit', 502);
+      return { checked: data.items };
+    },
+  });
+  assert.equal(calls, 3);
+  assert.deepEqual(result.data, { checked: [{ source_id: 'claims:0', status: 'missing' }] });
+  assert.equal(result.usage.inputTokens, 30);
+  assert.equal(result.usage.outputTokens, 60);
+});
+
+test('only bounded allowlisted internal validation hints are appended to retries', async () => {
+  process.env.LLM_MAX_ATTEMPTS = '2';
+  const privateValue = 'PRIVATE_SECRET_DO_NOT_ECHO';
+  const prompts = [];
+  globalThis.fetch = async (_url, init) => {
+    prompts.push(JSON.parse(init.body).contents[0].parts[0].text);
+    return googleResponse('{"items":[]}');
+  };
+  let calls = 0;
+  await runJsonStagePooled({
+    ...options(),
+    validate(data) {
+      if (++calls === 1) {
+        const error = new LLMError('The AI response did not match the required structure.', 'invalid_schema', 502);
+        // A raw property is deliberately ignored; only the private server hint map is read.
+        error.retryHint = privateValue;
+        throw withStructuredRetryHint(error, { kind: 'schema', stage: 'audit', issues: [
+          { path: ['items', 0, 'note'], expected: 'string' },
+          { path: ['items', 0, privateValue], expected: 'string' },
+          { path: ['items', Number.MAX_SAFE_INTEGER, 'note'], expected: 'string' },
+          { path: ['items', 0, 'status'], expected: privateValue },
+          { path: ['certainty', 0, 'marker'], expected: 'string' },
+        ] });
+      }
+      return data;
+    },
+  });
+  assert.equal(prompts.length, 2);
+  const hint = prompts[1].slice(prompts[1].indexOf('SCHEMA HINT'));
+  assert.match(hint, /items\.0\.note requires a string/);
+  assert.doesNotMatch(hint, /PRIVATE_SECRET|9007199254740991|certainty\.0\.marker/);
+  assert.ok(hint.length < 1000);
+});
+
+test('untrusted extraction categories and stages cannot create retry hints', async () => {
+  process.env.LLM_MAX_ATTEMPTS = '2';
+  for (const [code, hint] of [
+    ['invalid_extraction', { kind: 'source_span', category: 'PRIVATE_SECRET_DO_NOT_ECHO', index: 0, paragraph: 0 }],
+    ['invalid_schema', { kind: 'schema', stage: 'PRIVATE_SECRET_DO_NOT_ECHO', issues: [{ path: ['items'], expected: 'array' }] }],
+  ]) {
+    const prompts = [];
+    globalThis.fetch = async (_url, init) => { prompts.push(JSON.parse(init.body).contents[0].parts[0].text); return googleResponse('{"items":[]}'); };
+    let calls = 0;
+    await runJsonStagePooled({
+      ...options(), validate(data) {
+        if (++calls === 1) throw withStructuredRetryHint(new LLMError('The AI response did not meet the contract.', code, 502), hint);
+        return data;
+      },
+    });
+    assert.equal(prompts.length, 2);
+    assert.match(prompts[1], /Report genuine discrepancies/);
+    assert.doesNotMatch(prompts[1], /PRIVATE_SECRET|SCHEMA HINT|SOURCE-SPAN HINT/);
+  }
+});
+
+test('all malformed retries fail closed at the configured attempt limit with a safe validation error', async () => {
+  process.env.LLM_MAX_ATTEMPTS = '3';
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; return googleResponse('Private invalid generated response'); };
+  await assert.rejects(runJsonStagePooled(options()), (error) => {
+    assert.equal(error.code, 'invalid_json');
+    assert.doesNotMatch(error.message, /Private/);
+    return true;
+  });
+  assert.equal(calls, 3);
+});
+
+test('the shared transport deadline is not restarted after structured validation fails', async (t) => {
+  process.env.LLM_MAX_ATTEMPTS = '4';
+  process.env.LLM_TOTAL_TIMEOUT_MS = '100';
+  const originalNow = Date.now;
+  let now = 1000;
+  Date.now = () => now;
+  t.after(() => { Date.now = originalNow; });
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; return googleResponse('{"items":[]}'); };
+  await assert.rejects(runJsonStagePooled({
+    ...options(),
+    validate() { now += 101; throw new Error('Private validation failure'); },
+  }), (error) => error.code === 'invalid_schema' && !error.message.includes('Private'));
+  assert.equal(calls, 1);
+});
+
+test('a structured response that finishes validation after the shared deadline cannot succeed', async (t) => {
+  process.env.LLM_TOTAL_TIMEOUT_MS = '100';
+  const originalNow = Date.now;
+  let now = 1000;
+  Date.now = () => now;
+  t.after(() => { Date.now = originalNow; });
+  globalThis.fetch = async () => googleResponse('{"items":[]}');
+  await assert.rejects(runJsonStagePooled({
+    ...options(), validate(data) { now += 101; return data; },
+  }), (error) => error.code === 'timeout');
+});
+
+test('an accidentally async validator fails closed instead of returning unchecked promise data', async () => {
+  globalThis.fetch = async () => googleResponse('{"items":[]}');
+  await assert.rejects(runJsonStagePooled({
+    ...options(), async validate() { throw new Error('Private async validation details'); },
+  }), (error) => error.code === 'invalid_schema' && !error.message.includes('Private'));
+});
+
+test('permanent credentials stay excluded while a valid key retries invalid structured output', async () => {
+  process.env.LLM_MAX_ATTEMPTS = '3';
+  const config = loadProviderConfig({ OPENROUTER_API_KEY_1: 'synthetic-valid-free', OPENROUTER_API_KEY_2: 'synthetic-unauthorized' });
+  const bindings = [];
+  globalThis.fetch = async (_url, init) => {
+    bindings.push(init.headers.authorization);
+    if (init.headers.authorization === 'Bearer synthetic-unauthorized') return new Response('Private authentication details', { status: 401 });
+    return Response.json({
+      model: bindings.length === 1 ? 'vendor/first-free' : 'vendor/final-free',
+      choices: [{ finish_reason: 'stop', message: { content: bindings.length === 1 ? '{"unexpected":true}' : '{"items":[]}' } }],
+      usage: { prompt_tokens: 4, completion_tokens: 5 },
+    });
+  };
+  const result = await runJsonStagePooled({
+    ...options(), ...config,
+    validate(data) { if (!Array.isArray(data.items)) throw new Error('Private schema details'); },
+  });
+  assert.deepEqual(bindings, ['Bearer synthetic-valid-free', 'Bearer synthetic-unauthorized', 'Bearer synthetic-valid-free']);
+  assert.deepEqual(result.usage, { inputTokens: 8, outputTokens: 10, free: true });
+  assert.equal(result.model, 'openrouter/vendor/final-free');
+});
+
+test('later credential failures do not hide a more specific audit coverage failure', async () => {
+  process.env.LLM_MAX_ATTEMPTS = '2';
+  const config = configured({ GOOGLE_API_KEY: 'synthetic-working-but-incomplete', OPENROUTER_API_KEY: 'synthetic-rejected-fallback' });
+  globalThis.fetch = async (url) => String(url).includes('googleapis') ? googleResponse('{"items":[]}') : new Response('Private rejected credentials', { status: 403 });
+  await assert.rejects(runJsonStagePooled({
+    ...options(), ...config,
+    validate() { throw new LLMError('The audit must cover every original source item.', 'incomplete_audit', 502); },
+  }), (error) => error.code === 'incomplete_audit' && !error.message.includes('Private'));
+});
+
+test('paid validation attempts cannot become free usage when a later free route succeeds', async () => {
+  process.env.LLM_MAX_ATTEMPTS = '2';
+  const config = configured({ GOOGLE_API_KEY: 'synthetic-paid-first', OPENROUTER_API_KEY: 'synthetic-free-fallback', OPENROUTER_MODEL_FAST: 'vendor/fallback:free' });
+  globalThis.fetch = async (url) => String(url).includes('googleapis') ? googleResponse('Malformed paid output') : Response.json({
+    model: 'vendor/actual-selected-free', choices: [{ finish_reason: 'stop', message: { content: '{"items":[]}' } }],
+    usage: { prompt_tokens: 7, completion_tokens: 8 },
+  });
+  const result = await runJsonStagePooled({ ...options(), ...config });
+  assert.deepEqual(result.usage, { inputTokens: 17, outputTokens: 28, free: false });
+  assert.equal(result.free, false);
+  assert.equal(result.provider, 'openrouter');
+  assert.equal(result.model, 'openrouter/vendor/actual-selected-free');
+});
+
+test('aggregate retry usage cannot overflow safe token counters', async () => {
+  process.env.LLM_MAX_ATTEMPTS = '2';
+  let calls = 0;
+  globalThis.fetch = async () => Response.json({
+    candidates: [{ finishReason: 'STOP', content: { parts: [{ text: ++calls === 1 ? 'not JSON' : '{"items":[]}' }] } }],
+    usageMetadata: { promptTokenCount: Number.MAX_SAFE_INTEGER, candidatesTokenCount: Number.MAX_SAFE_INTEGER },
+  });
+  const result = await runJsonStagePooled(options());
+  assert.equal(result.usage.inputTokens, Number.MAX_SAFE_INTEGER);
+  assert.equal(result.usage.outputTokens, Number.MAX_SAFE_INTEGER);
+});
+
 test('transport deadline covers reading a stalled response body', async () => {
   process.env.LLM_REQUEST_TIMEOUT_MS = '100';
   process.env.LLM_TOTAL_TIMEOUT_MS = '100';
@@ -293,8 +507,56 @@ test('transport deadline covers reading a stalled response body', async () => {
 });
 
 test('retry budgets are bounded even for invalid or excessive environment overrides', () => {
-  assert.deepEqual(requestLimits({}), { timeout: 60000, total: 120000, attempts: 4 });
-  assert.deepEqual(requestLimits({ LLM_REQUEST_TIMEOUT_MS: '99999999', LLM_TOTAL_TIMEOUT_MS: '99999999', LLM_MAX_ATTEMPTS: '99999' }), { timeout: 60000, total: 120000, attempts: 4 });
+  assert.deepEqual(requestLimits({}), { timeout: 240000, total: 270000, attempts: 4 });
+  assert.deepEqual(requestLimits({ LLM_REQUEST_TIMEOUT_MS: '99999999', LLM_TOTAL_TIMEOUT_MS: '99999999', LLM_MAX_ATTEMPTS: '99999' }), { timeout: 270000, total: 270000, attempts: 4 });
+  assert.deepEqual(requestLimits({ LLM_REQUEST_TIMEOUT_MS: '', LLM_TOTAL_TIMEOUT_MS: ' ', LLM_MAX_ATTEMPTS: 'invalid' }), { timeout: 240000, total: 270000, attempts: 4 });
+  assert.deepEqual(requestLimits({ LLM_REQUEST_TIMEOUT_MS: '180000', LLM_TOTAL_TIMEOUT_MS: '240000', LLM_MAX_ATTEMPTS: '2' }), { timeout: 180000, total: 240000, attempts: 2 });
+});
+
+test('a model response after the former attempt and total deadlines completes successfully', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  let signal;
+  globalThis.fetch = (_url, init) => new Promise((resolve, reject) => {
+    signal = init.signal;
+    const timer = setTimeout(() => resolve(googleResponse('A complete long-document rewrite.')), 225000);
+    signal.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(new DOMException('aborted', 'AbortError'));
+    }, { once: true });
+  });
+  const waiting = pooledComplete(options());
+  t.mock.timers.tick(225000);
+  const result = await waiting;
+  assert.equal(result.text, 'A complete long-document rewrite.');
+  assert.equal(signal.aborted, false);
+});
+
+test('a stalled model response body remains bounded by the longer default attempt timeout', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  let signal;
+  let bodyStarted;
+  const ready = new Promise(resolve => { bodyStarted = resolve; });
+  globalThis.fetch = (_url, init) => {
+    signal = init.signal;
+    return { ok: true, json: () => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      bodyStarted();
+    }) };
+  };
+  const waiting = assert.rejects(pooledComplete(options()), error => error.code === 'timeout');
+  await ready;
+  t.mock.timers.tick(239999);
+  assert.equal(signal.aborted, false);
+  t.mock.timers.tick(1);
+  await waiting;
+  assert.equal(signal.aborted, true);
+});
+
+test('model and browser deadlines leave room around the deployed stage function limit', async () => {
+  const config = JSON.parse(await readFile(new URL('../vercel.json', import.meta.url), 'utf8'));
+  const functionLimit = config.functions['api/run-stage.js'].maxDuration * 1000;
+  assert.ok(MAX_MODEL_BUDGET_MS + 15000 < functionLimit, 'The Neon guard and response handling must fit after the model budget');
+  assert.ok(API_REQUEST_TIMEOUT_MS > functionLimit, 'The browser must wait long enough to receive a function response');
 });
 
 test('deterministic audit rejects numeric substrings and checks entire quotations', () => {
